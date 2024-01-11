@@ -301,10 +301,15 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
 
                     await log_duel(conn, submitting_playfabid, winner_playfabid, winner_score, new_winner_elo_exact, loser_playfabid, loser_score, new_loser_elo_exact)
 
+                    # Update Kills and Deaths
+                    await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", winner_score, loser_score, winner.id)
+                    await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", loser_score, winner_score, loser.id)
+
+                    # Update ELO score for winner, then loser, then increase their overall match count.
                     await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_winner_elo_exact, winner.id)
                     await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_loser_elo_exact, loser.id)
                     await conn.execute("UPDATE ranked_players SET matches = matches + 1 WHERE discordid = ANY($1::bigint[])", [winner.id, loser.id])
-
+                    # static coin reward?
                     coin_reward = 3
                     await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE playfabid = ANY($2::text[])", coin_reward, [winner_playfabid, loser_playfabid])
 
@@ -1187,13 +1192,26 @@ async def register(interaction: discord.Interaction, playfabid: str):
         """, (player_id, playfabid, interaction.user.id, interaction.user.display_name, common_name, 1500))
         conn.commit()
 
+        # Find the "Ranked Combatant" role in the guild
+        role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
+        if role:
+            try:
+                # Add the role to the user
+                await interaction.user.add_roles(role)
+                role_message = f" You have been assigned the '{role.name}' role."
+            except Exception as e:
+                print(f"Failed to assign role: {e}")
+                role_message = " However, I was unable to assign the 'Ranked Combatant' role."
+        else:
+            role_message = " However, the 'Ranked Combatant' role was not found in this server."
+
         # Public message with the registration information
         embed = discord.Embed(
             title="Player Registration Complete",
             description=f"{interaction.user.mention} has successfully registered for ranked combat.\n\n"
                         f"Common Name: {common_name}\n"
                         f"Starting Duels ELO: 1500\n"
-                        f"View [ChivStats.xyz player profile](https://chivstats.xyz/leaderboards/player/{playfabid}/)",
+                        f"View [ChivStats.xyz player profile](https://chivstats.xyz/leaderboards/player/{playfabid}/)\n\n{role_message}",
             color=discord.Color.green()
         )
         await interaction.followup.send(embed=embed)
@@ -1218,10 +1236,23 @@ async def reactivate(interaction: discord.Interaction):
         playfabid, common_name, elo_rating = result
         conn.commit()
 
+        # Find the "Ranked Combatant" role in the guild
+        role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
+        if role:
+            try:
+                # Add the role back to the user
+                await interaction.user.add_roles(role)
+                role_message = "Player re-added to the 'Ranked Combatant' role."
+            except Exception as e:
+                print(f"Failed to assign role: {e}")
+                role_message = "Error: Unable to re-add player to the 'Ranked Combatant' role."
+        else:
+            role_message = "Error: 'Ranked Combatant' role was not found in this server."
+
         playfab_link = f"https://chivstats.xyz/leaderboards/player/{playfabid}/"
         embed = discord.Embed(
             title="Reactivation Announcement",
-            description=f"{interaction.user.mention} ({common_name}) has reactivated their account for ranked matches.\n\nDuels ELO: {elo_rating}\n[View {common_name} on ChivStats.xyz]({playfab_link})",
+            description=f"{interaction.user.mention} ({common_name}) has reactivated their account for ranked matches.\n\nDuels ELO: {elo_rating}\n[View {common_name} on ChivStats.xyz]({playfab_link})\n\n{role_message}",
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed)
@@ -1231,6 +1262,7 @@ async def reactivate(interaction: discord.Interaction):
     finally:
         if conn is not None:
             conn.close()
+
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Retire your account from ranked matches.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
@@ -1243,10 +1275,23 @@ async def retire(interaction: discord.Interaction):
         playfabid, common_name, elo_rating = result
         conn.commit()
 
+        # Find the "Ranked Combatant" role in the guild
+        role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
+        if role:
+            try:
+                # Remove the role from the user
+                await interaction.user.remove_roles(role)
+                role_message = "Player removed from the 'Ranked Combatant' role."
+            except Exception as e:
+                print(f"Failed to remove role: {e}")
+                role_message = "Error: Unable to remove player from the 'Ranked Combatant' role."
+        else:
+            role_message = "Error: The 'Ranked Combatant' role was not found in this server."
+
         playfab_link = f"https://chivstats.xyz/leaderboards/player/{playfabid}/"
         embed = discord.Embed(
             title="Retirement Announcement",
-            description=f"{interaction.user.mention} ({common_name}) has retired from ranked matches.\n\nDuels ELO: {elo_rating}\n[View {common_name} on ChivStats.xyz]({playfab_link})",
+            description=f"{interaction.user.mention} ({common_name}) has retired from ranked matches.\n\nDuels ELO: {elo_rating}\n[View {common_name} on ChivStats.xyz]({playfab_link})\n\n{role_message}",
             color=discord.Color.blue()
         )
         await interaction.response.send_message(embed=embed)
@@ -1256,7 +1301,6 @@ async def retire(interaction: discord.Interaction):
     finally:
         if conn is not None:
             conn.close()
-
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Set your in-game name.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
