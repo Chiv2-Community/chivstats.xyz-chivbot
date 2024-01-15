@@ -1,14 +1,14 @@
 import os
 import asyncio
-import psycopg2
 import discord
 from discord.ext import commands
 from discord.ext.commands import check, CheckFailure
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import asyncpg
 import traceback
 import pytz
+import json
 
 
 # Database connection credentials
@@ -20,6 +20,10 @@ HOST = "/var/run/postgresql"
 # Not including guild ids causes a delay in command update replication.
 DUELS_LEADERBOARD_URL = "https://chivstats.xyz/leaderboards/ranked_combat/" 
 GUILD_IDS = [1111684756896239677, 878005964685582406, 1163168644524687394]
+# Send an audit message to a specific guild and channel
+target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
 
 # Fetch the Discord bot token from environment variables
 TOKEN = os.getenv('CHIVBOT_KEY')
@@ -131,12 +135,12 @@ async def format_playfab_id_with_url(playfabid):
     finally:
         await close_db_connection(conn)
 
-# And the updated get_most_common_alias function
 async def get_most_common_alias(conn, playfabid):
     try:
         result = await conn.fetchrow("SELECT alias_history FROM players WHERE playfabid = $1", playfabid)
         if result and result['alias_history']:
-            alias_history = result['alias_history']
+            # Parse the JSON string into a Python dictionary
+            alias_history = json.loads(result['alias_history'])
             most_common_alias = max(alias_history, key=alias_history.get, default="Unknown Alias")
             return most_common_alias
         else:
@@ -249,6 +253,23 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
         submitter_label = " (submitter)" if initiator == interaction.user and winner != initiator else ""
         command_text = f"/submit_duel @{initiator.display_name} {initiator_score} @{opponent.display_name} {opponent_score}"
 
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = f"@{initiator.display_name} {initiator_score} @{opponent.display_name} {opponent_score}"
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player {interaction.user.display_name} (ID: {interaction.user.id}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
         embed = discord.Embed(title="Duel Result (UNVERIFIED)", description=f"Command: `{command_text}`", color=discord.Color.orange())
         embed.add_field(name="Matchup", value=f"{winner.display_name}{winner_label} vs {loser.display_name}{submitter_label}", inline=False)
         embed.add_field(name="Score", value=f"{winner_score}-{loser_score}", inline=True)
@@ -327,12 +348,29 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
                             await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
 
                     total_reward = coin_reward + payout_amount
-                    embed = discord.Embed(title="Duel Result Confirmed", description=f"Command: `{command_text}`\n\nView the updated rankings on the [Duels Leaderboard]({DUELS_LEADERBOARD_URL}).", color=discord.Color.green())
+                    embed = discord.Embed(title=f"1v1 Duel Winner: {winner.display_name}", description=f"Command: `{command_text}`\n\nView the updated rankings on the [Duels Leaderboard]({DUELS_LEADERBOARD_URL}).", color=discord.Color.green())
                     embed.set_footer(text=f"Match result confirmed by {user.display_name}.")
                     embed.add_field(name="Winner's New ELO", value=f"{winner.display_name}: {round(new_winner_elo_exact)} ({winner_elo_change_formatted})", inline=True)
                     embed.add_field(name="Loser's New ELO", value=f"{loser.display_name}: {round(new_loser_elo_exact)} ({loser_elo_change_formatted})", inline=True)
                     embed.add_field(name=f"Coin Reward [+{total_reward} :coin:]", value=f"Both fighters paid {coin_reward} coin, with a +{payout_amount} house bonus.", inline=False)
                     await duel_message.edit(embed=embed)
+                    original_channel = interaction.channel
+                    # Iterate through each guild the bot is a part of
+                    channels_sent = 0
+                    for guild in bot.guilds:
+                        # Find the #chivstats-ranked channel
+                        channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+                        if channel and channel != original_channel:
+                            try:
+                                embed_copy = embed.copy()
+                                await asyncio.sleep(0.5)  # Add a 500ms delay
+                                await channel.send(embed=embed_copy)
+                                channels_sent += 1
+                            except Exception as e:
+                                print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
+                    if audit_channel:
+                        audit_message = f"Duel echoed to {channels_sent} channels."
+                        await audit_channel.send(audit_message)
                     await verification_message.delete()
                 else:
                     await interaction.followup.send("One or both players are not registered in the ranking system.", ephemeral=True)
@@ -531,7 +569,7 @@ async def submit_duo(interaction: discord.Interaction, team_member: discord.Memb
         team2_elo = await conn.fetchval("SELECT elo_rating FROM duo_teams WHERE id = $1", team2_id)
 
         embed = discord.Embed(
-            title="2v2 Duel Result (UNVERIFIED)",
+            title="2v2 Duos Match Submitted (UNVERIFIED)",
             description=f"`{command_text}`\n\n"
                         f"Team 1: <@{interaction.user.id}> and <@{team_member.id}> - Score: {team_score}\n"
                         f"Team 2: <@{enemy1.id}> and <@{enemy2.id}> - Score: {enemy_score}",
@@ -586,21 +624,40 @@ async def submit_duo(interaction: discord.Interaction, team_member: discord.Memb
                 team1_elo_change_str = f"({team1_elo_change:+})" if team1_elo_change != 0 else "(±0)"
                 team2_elo_change_str = f"({team2_elo_change:+})" if team2_elo_change != 0 else "(±0)"
 
-                # Update the embed with the new ELO ratings
-                embed.title = "2v2 Duel Result Confirmed"
-                embed.color = discord.Color.green()
-                embed.set_footer(text=f"Match result confirmed by {user.display_name}.")
+                # Insert the match data into the "duos" table
+                await conn.execute("INSERT INTO duos (submitting_playfabid, winner_team_id, winner_score, winner_elo, loser_team_id, loser_score, loser_elo) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                                team1_playfabid1, team1_id, team_score, team1_new_elo, team2_id, enemy_score, team2_new_elo)
 
                 # Determine the winning team and set labels accordingly
                 if team_score > enemy_score:
                     submitting_team_label = "Winners"
                     opposing_team_label = "Losers"
+                    embed.title = f"2v2 Duos Match Winners: {team1_name}"
                 else:
                     submitting_team_label = "Losers"
                     opposing_team_label = "Winners"
-                embed.add_field(name=f"{submitting_team_label} - {team1_name} ELO: {team1_new_elo_rounded} {team1_elo_change_str}", value=f"<@{interaction.user.id}> (submitter) and <@{team_member.id}>", inline=False)
-                embed.add_field(name=f"{opposing_team_label} - {team2_name} ELO: {team2_new_elo_rounded} {team2_elo_change_str}", value=f"<@{enemy1.id}> and <@{enemy2.id}>", inline=False)
+                    embed.title = f"2v2 Duos Match Winners: {team2_name}"
+
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Match result confirmed by {user.display_name}.")                
+                embed.add_field(name=f"{submitting_team_label} - {team1_name} ELO: {team1_new_elo_rounded} {team1_elo_change_str}", value=f"{interaction.user.display_name} (submitter) and {team_member.display_name}", inline=False)
+                embed.add_field(name=f"{opposing_team_label} - {team2_name} ELO: {team2_new_elo_rounded} {team2_elo_change_str}", value=f"{enemy1.display_name} and {enemy2.display_name}", inline=False)
                 await sent_message.edit(embed=embed)
+                original_channel = interaction.channel
+                # Iterate through each guild the bot is a part of
+                channels_sent = 0
+                for guild in bot.guilds:
+                    # Find the #chivstats-ranked channel
+                    channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+                    if channel and channel != original_channel:
+                        try:
+                            embed_copy = embed.copy()
+                            embed_copy.description=f"`{command_text}`\n\n Team 1: {interaction.user.display_name} and {team_member.display_name} - Score: {team_score}\n Team 2: {enemy1.display_name} and {enemy2.display_name} - Score: {enemy_score}"
+                            await asyncio.sleep(0.5)  # Add a 500ms delay
+                            await channel.send(embed=embed_copy)
+                            channels_sent += 1
+                        except Exception as e:
+                            print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
 
             elif str(reaction.emoji) == '❌':
                 # Process the duel result as denied
@@ -644,6 +701,17 @@ async def duo_setup_team(interaction: discord.Interaction, team_member: discord.
         await conn.execute("UPDATE duo_teams SET team_name = $1 WHERE id = $2", team_name, team_id)
 
         # Announce the update
+        announcement_message = f"{interaction.user.display_name} (with {team_member.display_name}) set the duo's name to {team_name}"
+
+        # Iterate through guild_ids
+        for guild_id in GUILD_IDS:
+            guild = bot.get_guild(guild_id)
+            if guild:
+                local_channel = discord.utils.get(guild.text_channels, name="your_local_channel_name")  # Replace with your local channel name
+                if local_channel:
+                    await local_channel.send(announcement_message)
+                await asyncio.sleep(0.5)  # 500ms pause between messages
+
         await interaction.response.send_message(f"Team name set to '{team_name}'.", ephemeral=True)
 
     except Exception as e:
@@ -652,6 +720,7 @@ async def duo_setup_team(interaction: discord.Interaction, team_member: discord.
 
     finally:
         await conn.close()
+
 
 
 
@@ -707,62 +776,58 @@ async def duo_teams(interaction: discord.Interaction):
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def rank(interaction: discord.Interaction, target_member: discord.Member = None):
     discord_id = target_member.id if target_member else interaction.user.id
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
 
     try:
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+
         # Fetch player's Duels ELO (elo_duelsx), kills, deaths, matches, PlayFab ID, username, and coins
-        cur.execute("""
+        result = await conn.fetchrow("""
             SELECT elo_duelsx, kills, deaths, matches, playfabid, discord_username, common_name, coins 
             FROM ranked_players 
-            WHERE discordid = %s
-            """, (discord_id,))
-        result = cur.fetchone()
+            WHERE discordid = $1
+            """, discord_id)
 
         if result:
             elo_duelsx, kills, deaths, matches, playfabid, discord_username, common_name, coins = result
             elo_duelsx_rounded = round(elo_duelsx)  # Round ELO to a whole number
             kdr = kills / deaths if deaths > 0 else kills  # Avoid division by zero
 
-
             # Calculate player's wealth rank based on coins
-            cur.execute("""
+            wealth_rank_result = await conn.fetchval("""
                 SELECT COUNT(*) + 1 
                 FROM ranked_players 
-                WHERE coins > %s
-                """, (coins,))
-            wealth_rank_result = cur.fetchone()
-            wealth_rank = f"**#{wealth_rank_result[0]}**" if wealth_rank_result else '**N/A**'
+                WHERE coins > $1
+                """, coins)
+            wealth_rank = f"**#{wealth_rank_result}**" if wealth_rank_result else '**N/A**'
 
             # Calculate the player's ELO rank
-            cur.execute("""
+            elo_rank_result = await conn.fetchval("""
                 SELECT COUNT(*) + 1 
                 FROM ranked_players
-                WHERE elo_duelsx > %s
-                """, (elo_duelsx,))
-            elo_rank_result = cur.fetchone()
-            elo_rank = f"**#{elo_rank_result[0]}**" if elo_rank_result else '**N/A**'
+                WHERE elo_duelsx > $1
+                """, elo_duelsx)
+            elo_rank = f"**#{elo_rank_result}**" if elo_rank_result else '**N/A**'
 
             # Calculate the player's KDR rank
-            cur.execute("""
+            kdr_rank_result = await conn.fetchval("""
                 SELECT COUNT(*) + 1 
                 FROM ranked_players
-                WHERE (CAST(kills AS FLOAT) / NULLIF(deaths, 0)) > %s
-                """, (kdr,))
-            kdr_rank_result = cur.fetchone()
-            kdr_rank = f"**#{kdr_rank_result[0]}**" if kdr_rank_result else '**N/A**'
+                WHERE (CAST(kills AS FLOAT) / NULLIF(deaths, 0)) > $1
+                """, kdr)
+            kdr_rank = f"**#{kdr_rank_result}**" if kdr_rank_result else '**N/A**'
 
             # Calculate the player's matches rank
-            cur.execute("""
+            matches_rank_result = await conn.fetchval("""
                 SELECT COUNT(*) + 1 
                 FROM ranked_players
-                WHERE matches > %s
-                """, (matches,))
-            matches_rank_result = cur.fetchone()
-            matches_rank = f"**#{matches_rank_result[0]}**" if matches_rank_result else '**N/A**'
+                WHERE matches > $1
+                """, matches)
+            matches_rank = f"**#{matches_rank_result}**" if matches_rank_result else '**N/A**'
 
             profile_url = f"https://chivstats.xyz/leaderboards/player/{playfabid}/"
             leaderboard_url = "https://chivstats.xyz/leaderboards/ranked_combat/"
+            
             # Embed construction
             embed = discord.Embed(
                 title=f"{common_name} Ranked Statistics",
@@ -784,8 +849,9 @@ async def rank(interaction: discord.Interaction, target_member: discord.Member =
         print(f"Database error: {e}")
         await interaction.response.send_message("An error occurred while fetching the player rank.", ephemeral=True)
     finally:
-        cur.close()
-        conn.close()
+        # Close the connection
+        if conn:
+            await conn.close()
 
 # Global list to track the queue for duels
 @bot.slash_command(guild_ids=GUILD_IDS, description="Enter the matchmaking queue for a duel.")
@@ -863,63 +929,56 @@ async def queue(interaction: discord.Interaction, action: str):
 async def clown(interaction: discord.Interaction, member: discord.Member):
     cost = 25
     clown_emoji = "🤡"
-    
-    # Connect to the database
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
-    conn.autocommit = False
-    
+
     try:
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+
         # Check and fetch the user's coins and lock the row
-        cur.execute("SELECT coins FROM ranked_players WHERE discordid = %s FOR UPDATE", (interaction.user.id,))
-        user_coins = cur.fetchone()[0]
-        
-        if user_coins < cost:
-            await interaction.response.send_message("You do not have enough coins.", ephemeral=True)
-            conn.rollback()
-            return
-        
-        # Determine the global action to be taken (clown or declown)
-        global_action = "clown" if clown_emoji not in member.display_name else "declown"
-        
-        # Proceed with the coin transaction
-        new_balance = user_coins - cost
-        cur.execute("UPDATE ranked_players SET coins = %s WHERE discordid = %s", (new_balance, interaction.user.id))
-        
-        # Update the house account balance
-        update_house_account_balance(cur, cost)
-        
-        # Commit the transaction
-        conn.commit()
+        async with conn.transaction():
+            user_coins = await conn.fetchval("SELECT coins FROM ranked_players WHERE discordid = $1 FOR UPDATE", interaction.user.id)
 
-        # Iterate through all guilds to update the member's nickname
-        for guild in bot.guilds:
-            try:
-                guild_member = await guild.fetch_member(member.id)
-                if guild_member and guild.me.guild_permissions.manage_nicknames:
-                    new_nickname = f"{clown_emoji} {guild_member.display_name}" if global_action == "clown" else guild_member.display_name.replace(clown_emoji, "").strip()
-                    await guild_member.edit(nick=new_nickname)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass  # Handle exceptions silently
+            if user_coins < cost:
+                await interaction.response.send_message("You do not have enough coins.", ephemeral=True)
+                return
 
-        # Announce the action in all relevant channels
-        for guild in bot.guilds:
-            if guild.get_member(member.id):
-                chivstats_channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
-                if chivstats_channel:
-                    announcement = f"{member.mention} has been {global_action}ed globally. 25 coins deposited to the house account by an anonymous donor."
-                    await chivstats_channel.send(announcement)
+            # Determine the global action to be taken (clown or declown)
+            global_action = "clown" if clown_emoji not in member.display_name else "declown"
 
-        # Send confirmation to the user who invoked the command
-        await interaction.response.send_message(f"{member.mention} has been {global_action}ed globally. Cost was {cost} coins. Your remaining balance is {new_balance} coins.", ephemeral=True)
+            # Proceed with the coin transaction
+            new_balance = user_coins - cost
+            await conn.execute("UPDATE ranked_players SET coins = $1 WHERE discordid = $2", new_balance, interaction.user.id)
+
+            # Update the house account balance
+            await update_house_account_balance(conn, cost)
+
+            # Iterate through all guilds to update the member's nickname
+            for guild in bot.guilds:
+                try:
+                    guild_member = await guild.fetch_member(member.id)
+                    if guild_member and guild.me.guild_permissions.manage_nicknames:
+                        new_nickname = f"{clown_emoji} {guild_member.display_name}" if global_action == "clown" else guild_member.display_name.replace(clown_emoji, "").strip()
+                        await guild_member.edit(nick=new_nickname)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass  # Handle exceptions silently
+
+            # Announce the action in all relevant channels
+            for guild in bot.guilds:
+                if guild.get_member(member.id):
+                    chivstats_channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+                    if chivstats_channel:
+                        announcement = f"{member.mention} has been {global_action}ed globally. 25 coins deposited to the house account by an anonymous donor."
+                        await chivstats_channel.send(announcement)
+
+            # Send confirmation to the user who invoked the command
+            await interaction.response.send_message(f"{member.mention} has been {global_action}ed globally. Cost was {cost} coins. Your remaining balance is {new_balance} coins.", ephemeral=True)
 
     except Exception as e:
         await interaction.response.send_message("An error occurred while processing your request. Please try again.", ephemeral=True)
-        conn.rollback()
     finally:
-        cur.close()
-        conn.autocommit = True
-        conn.close()
+        # Close the connection
+        if conn:
+            await conn.close()
 
 def update_house_account_balance(cur, amount):
     # Fetch the latest house balance or initialize if no entry exists
@@ -940,21 +999,37 @@ def update_house_account_balance(cur, amount):
 @bot.slash_command(guild_ids=GUILD_IDS, description="Displays the house account value and the current payout rate.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def bank(interaction: discord.Interaction):
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
-
     try:
-        cur.execute("SELECT balance, payout_rate FROM house_account ORDER BY last_updated DESC LIMIT 1")
-        house_account_entry = cur.fetchone()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+
+        # Fetch the latest house account entry
+        house_account_entry = await conn.fetchrow("SELECT balance, payout_rate FROM house_account ORDER BY last_updated DESC LIMIT 1")
 
         if house_account_entry:
             balance, payout_rate = house_account_entry
             embed = discord.Embed(
                 title=":bank: House Account",
-                description=f"**Account Balance:** {balance} coins(:coin:)\n**Payout Rate:** {payout_rate}%",
+                description=f"**Account Balance:** {balance} coins (:coin:)\n**Payout Rate:** {payout_rate}%",
                 color=discord.Color.gold()
             )
             await interaction.response.send_message(embed=embed)
+
+            # Rebuild the entered slash command for auditing
+            command_name = interaction.command.name
+            entered_command = f"/{command_name}"
+
+            # Send an audit message to a specific guild and channel
+            target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+            audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+            # Get the target guild and channel
+            target_guild = bot.get_guild(target_guild_id)
+            audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+            if audit_channel:
+                audit_message = f"{interaction.user.display_name} (ID: {interaction.user.id}) has executed: {entered_command}"
+                await audit_channel.send(audit_message)
         else:
             await interaction.response.send_message("The house bank information is currently unavailable.", ephemeral=True)
 
@@ -963,31 +1038,33 @@ async def bank(interaction: discord.Interaction):
         print(f"Database error: {e}")
 
     finally:
-        cur.close()
-        conn.close()
+        # Close the connection
+        if conn:
+            await conn.close()
 
-def update_queue_time(discord_id, time_spent):
+
+async def update_queue_time(discord_id, time_spent):
     total_time_queued = 0
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
-        cur.execute("SELECT time_queued FROM ranked_players WHERE discordid = %s", (discord_id,))
-        result = cur.fetchone()
-        if result:
-            # Add the current session's time spent to the total time and update the database
-            total_time_queued = result[0] + time_spent
-            cur.execute("""
-                UPDATE ranked_players
-                SET time_queued = %s
-                WHERE discordid = %s
-            """, (total_time_queued, discord_id))
-            conn.commit()
+        # Fetch the current time queued
+        time_queued = await conn.fetchval("SELECT time_queued FROM ranked_players WHERE discordid = $1", discord_id)
+
+        if time_queued is not None:
+            # Add the current session's time spent to the total time
+            total_time_queued = time_queued + time_spent
+
+            # Update the database with the new total time queued
+            await conn.execute("UPDATE ranked_players SET time_queued = $1 WHERE discordid = $2", total_time_queued, discord_id)
+        
     except Exception as e:
         print(f"Database error: {e}")
     finally:
+        # Close the connection
         if conn:
-            conn.close()
+            await conn.close()
 
     return total_time_queued
 
@@ -995,37 +1072,39 @@ def update_queue_time(discord_id, time_spent):
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def stats(interaction: discord.Interaction, playfabid: str = None):
     discord_id = interaction.user.id
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
-    cur.execute("SELECT retired FROM ranked_players WHERE discordid = %s", (discord_id,))
-    retired = cur.fetchone()
-    if retired and retired[0]:
-        await interaction.response.send_message("This account is retired. Please reactivate using /reactivate.", ephemeral=True)
-        return
 
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
-        if playfabid is None:
-            discord_id = interaction.user.id
-            cur.execute("SELECT playfabid FROM ranked_players WHERE discordid = %s", (discord_id,))
-            result = cur.fetchone()
-            if result:
-                playfabid = result[0]
-            else:
+        # Check if the user's account is retired
+        retired = await conn.fetchval("SELECT retired FROM ranked_players WHERE discordid = $1", discord_id)
+        if retired:
+            await interaction.response.send_message("This account is retired. Please reactivate using /reactivate.", ephemeral=True)
+            return
+
+        # Access the playfabid option directly from interaction
+        playfabid_option = interaction.options.get('playfabid')
+
+        if playfabid_option:
+            playfabid = playfabid_option.value
+        else:
+            # If playfabid is not provided, fetch the user's linked PlayFab ID
+            playfabid = await conn.fetchval("SELECT playfabid FROM ranked_players WHERE discordid = $1", discord_id)
+
+            if not playfabid:
                 embed = discord.Embed(
                     title="Stats Lookup",
-                    description=f"Your Discord account is not linked to any PlayFab ID. Find your PlayFab ID [here](https://chivstats.xyz/leaderboards/player_search/), and use /register",
+                    description="Your Discord account is not linked to any PlayFab ID. Find your PlayFab ID [here](https://chivstats.xyz/leaderboards/player_search/), and use /register",
                     color=discord.Color.red()
                 )
-                await interaction.response.send_message(embed=embed)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
 
         common_name = await get_common_name_from_ranked_players(conn, playfabid)
-        playfab_link = await format_playfab_id_with_url(conn, playfabid)
+        playfab_link = await format_playfab_id_with_url(playfabid)
 
-        stats = get_player_latest_stats_and_rank(playfabid)
+        stats = await get_player_latest_stats_and_rank(playfabid)
         if stats:
             embed = discord.Embed(
                 title=f"Latest Stats for {common_name}",
@@ -1038,75 +1117,99 @@ async def stats(interaction: discord.Interaction, playfabid: str = None):
                     value=f"Value - {info['stat_value']}, Serial Number - {info['serialnumber']}, Rank - {info['rank']}",
                     inline=False
                 )
-            await interaction.response.send_message(embed=embed)
+
+            # Rebuild the entered slash command for auditing
+            command_name = interaction.command.name
+            entered_command = f"/{command_name} playfabid={playfabid}"
+
+            # Send an audit message to a specific guild and channel
+            target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+            audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+            # Get the target guild and channel
+            target_guild = bot.get_guild(target_guild_id)
+            audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+            if audit_channel:
+                audit_message = f"Player {common_name} (ID: {interaction.user.id}, PlayFab ID: {playfabid}) has executed: {entered_command}"
+                await audit_channel.send(audit_message)
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
         else:
             embed = discord.Embed(
                 title="Stats Lookup",
                 description=f"Could not find stats for PlayFab ID {playfab_link}",
                 color=discord.Color.red()
             )
-            await interaction.response.send_message(embed=embed)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
     except Exception as e:
         print(f"Database error: {e}")
         embed = discord.Embed(
             title="Stats Lookup",
-            description=f"An error occurred while processing your request.",
+            description="An error occurred while processing your request.",
             color=discord.Color.red()
         )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
     finally:
-        if conn is not None:
-            conn.close()
+        if conn:
+            await conn.close()
 
-def get_player_latest_stats_and_rank(playfabid):
+
+
+
+
+
+async def get_player_latest_stats_and_rank(playfabid):
     stats = {}
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
         for leaderboard in leaderboard_classes:
             # Get the most recent serialnumber and stat_value for the player
-            cur.execute(f"""
+            query = f"""
                 SELECT stat_value, serialnumber
                 FROM {leaderboard}
-                WHERE playfabid = %s
+                WHERE playfabid = $1
                 ORDER BY serialnumber DESC
                 LIMIT 1
-                """, (playfabid,))
-            result = cur.fetchone()
+                """
+            result = await conn.fetchrow(query, playfabid)
 
             if result:
                 stat_value, serialnumber = result
                 # Get the rank of the player based on stat_value
-                cur.execute(f"""
+                query = f"""
                     SELECT COUNT(*) + 1
                     FROM {leaderboard}
-                    WHERE serialnumber = %s AND stat_value > %s
-                    """, (serialnumber, stat_value))
-                rank = cur.fetchone()[0]
+                    WHERE serialnumber = $1 AND stat_value > $2
+                    """
+                rank = await conn.fetchval(query, serialnumber, stat_value)
 
                 stats[leaderboard] = {'stat_value': stat_value, 'serialnumber': serialnumber, 'rank': rank}
             else:
                 stats[leaderboard] = {'stat_value': 'No data', 'serialnumber': None, 'rank': None}
 
-        cur.close()
         return stats
     except Exception as e:
         print(f"Database error: {e}")  # Debugging print
         return None
+    finally:
+        if conn:
+            await conn.close()
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Checks registered status.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def status(interaction: discord.Interaction, playfabid: str = None):
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
         # Use the Discord ID to find the linked PlayFab ID and retirement status
         discord_id = interaction.user.id if playfabid is None else None
         if discord_id:
-            cur.execute("SELECT playfabid, retired FROM ranked_players WHERE discordid = %s", (discord_id,))
-            result = cur.fetchone()
+            query = "SELECT playfabid, retired FROM ranked_players WHERE discordid = $1"
+            result = await conn.fetchrow(query, discord_id)
             if result:
                 playfabid, retired = result
                 playfab_link = f"https://chivstats.xyz/leaderboards/player/{playfabid}/"
@@ -1115,8 +1218,8 @@ async def status(interaction: discord.Interaction, playfabid: str = None):
             else:
                 description = "Your Discord account is not linked to any PlayFab ID."
         else:
-            cur.execute("SELECT discordid, retired FROM ranked_players WHERE playfabid = %s", (playfabid,))
-            result = cur.fetchone()
+            query = "SELECT discordid, retired FROM ranked_players WHERE playfabid = $1"
+            result = await conn.fetchrow(query, playfabid)
             if result:
                 linked_discord_id, retired = result
                 retirement_status = "Retired" if retired else "Active"
@@ -1131,13 +1234,32 @@ async def status(interaction: discord.Interaction, playfabid: str = None):
         )
         await interaction.response.send_message(embed=embed)
 
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = " ".join([f"{opt.name}={opt.value}" for opt in interaction.command.options])
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player (ID: {interaction.user.id}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
     except Exception as e:
         print(f"Database error: {e}")
         await interaction.response.send_message(f"An error occurred while processing your request.", ephemeral=True)
 
     finally:
-        if conn is not None:
-            conn.close()
+        if conn:
+            await conn.close()
+
+
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Links your Discord account to a PlayFab ID.")
@@ -1147,46 +1269,44 @@ async def register(interaction: discord.Interaction, playfabid: str):
     await interaction.response.defer()
 
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
         # Check if the provided PlayFab ID exists in the players table
-        cur.execute("SELECT id FROM players WHERE playfabid = %s", (playfabid,))
-        player = cur.fetchone()
-        if player is None:
+        query = "SELECT id FROM players WHERE playfabid = $1"
+        player_id = await conn.fetchval(query, playfabid)
+        if player_id is None:
             await interaction.followup.send("The provided PlayFab ID does not exist.", ephemeral=True)
             return
 
-        player_id = player[0]
-
         # Retrieve the common name (most common alias)
-        common_name = await get_most_common_alias(conn, playfabid)
+        common_name = await get_most_common_alias(playfabid)
 
         # Check if PlayFab ID already linked to a different Discord account
-        cur.execute("SELECT discordid FROM ranked_players WHERE playfabid = %s", (playfabid,))
-        linked_discord_id = cur.fetchone()
-        if linked_discord_id and linked_discord_id[0] != interaction.user.id:
+        query = "SELECT discordid FROM ranked_players WHERE playfabid = $1"
+        linked_discord_id = await conn.fetchval(query, playfabid)
+        if linked_discord_id and linked_discord_id != interaction.user.id:
             await interaction.followup.send("This PlayFab ID is already linked to another Discord account.", ephemeral=True)
             return
 
         # Check if Discord account already linked to a different PlayFab ID
-        cur.execute("SELECT playfabid FROM ranked_players WHERE discordid = %s", (interaction.user.id,))
-        linked_playfab_id = cur.fetchone()
+        query = "SELECT playfabid FROM ranked_players WHERE discordid = $1"
+        linked_playfab_id = await conn.fetchval(query, interaction.user.id)
         if linked_playfab_id:
             await interaction.followup.send("Your Discord account is already linked to a PlayFab ID.", ephemeral=True)
             return
 
         # Link PlayFab ID and Discord ID in players table
-        cur.execute("UPDATE players SET discordid = %s WHERE id = %s", (interaction.user.id, player_id))
-        conn.commit()
+        query = "UPDATE players SET discordid = $1 WHERE id = $2"
+        await conn.execute(query, interaction.user.id, player_id)
 
         # Insert into ranked_players table or update if exists
-        cur.execute("""
+        query = """
             INSERT INTO ranked_players (player_id, playfabid, discordid, discord_username, common_name, elo_rating)
-            VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (playfabid) DO 
+            VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (playfabid) DO 
             UPDATE SET discordid = EXCLUDED.discordid, discord_username = EXCLUDED.discord_username, common_name = EXCLUDED.common_name
-        """, (player_id, playfabid, interaction.user.id, interaction.user.display_name, common_name, 1500))
-        conn.commit()
+        """
+        await conn.execute(query, player_id, playfabid, interaction.user.id, interaction.user.display_name, common_name, 1500)
 
         # Find the "Ranked Combatant" role in the guild
         role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
@@ -1212,25 +1332,47 @@ async def register(interaction: discord.Interaction, playfabid: str):
         )
         await interaction.followup.send(embed=embed)
 
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = " ".join([f"{opt.name}={opt.value}" for opt in interaction.command.options])
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player (ID: {interaction.user.id}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
     except Exception as e:
         await interaction.followup.send("An error occurred while processing your request. Please try again.", ephemeral=True)
         print(f"Database error: {e}")
     finally:
-        if conn is not None:
-            conn.close()
+        if conn:
+            await conn.close()
+
+
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Reactivate your account for ranked matches.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def reactivate(interaction: discord.Interaction):
+    conn = None
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
+        # Establish an asynchronous connection
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
-        cur.execute("UPDATE ranked_players SET retired = FALSE WHERE discordid = %s RETURNING playfabid, common_name, elo_rating", (interaction.user.id,))
-        result = cur.fetchone()
+        # Execute the query asynchronously and fetch the result
+        result = await conn.fetchrow(
+            "UPDATE ranked_players SET retired = FALSE WHERE discordid = $1 RETURNING playfabid, common_name, elo_rating", 
+            interaction.user.id
+        )
         playfabid, common_name, elo_rating = result
-        conn.commit()
 
         # Find the "Ranked Combatant" role in the guild
         role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
@@ -1252,24 +1394,48 @@ async def reactivate(interaction: discord.Interaction):
             color=discord.Color.green()
         )
         await interaction.response.send_message(embed=embed)
+
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = " ".join([f"{opt.name}={opt.value}" for opt in interaction.command.options])
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player {common_name} (ID: {interaction.user.id}, PlayFab ID: {playfabid}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
     except Exception as e:
         await interaction.response.send_message("An error occurred while processing your request. Please try again.", ephemeral=True)
         print(f"Database error: {e}")
     finally:
+        # Close the connection asynchronously
         if conn is not None:
-            conn.close()
+            await conn.close()
+
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Retire your account from ranked matches.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def retire(interaction: discord.Interaction):
+    conn = None
     try:
-        conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-        cur = conn.cursor()
-        cur.execute("UPDATE ranked_players SET retired = TRUE WHERE discordid = %s RETURNING playfabid, common_name, elo_rating", (interaction.user.id,))
-        result = cur.fetchone()
+        # Establish an asynchronous connection
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+
+        # Execute the query asynchronously and fetch the result
+        result = await conn.fetchrow(
+            "UPDATE ranked_players SET retired = TRUE WHERE discordid = $1 RETURNING playfabid, common_name, elo_rating", 
+            interaction.user.id
+        )
         playfabid, common_name, elo_rating = result
-        conn.commit()
 
         # Find the "Ranked Combatant" role in the guild
         role = discord.utils.get(interaction.guild.roles, name="Ranked Combatant")
@@ -1290,36 +1456,79 @@ async def retire(interaction: discord.Interaction):
             description=f"{interaction.user.mention} ({common_name}) has retired from ranked matches.\n\nDuels ELO: {elo_rating}\n[View {common_name} on ChivStats.xyz]({playfab_link})\n\n{role_message}",
             color=discord.Color.blue()
         )
+        # Send the response to the user
         await interaction.response.send_message(embed=embed)
+
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = " ".join([f"{opt.name}={opt.value}" for opt in interaction.command.options])
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player {common_name} (ID: {interaction.user.id}, PlayFab ID: {playfabid}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
     except Exception as e:
         await interaction.response.send_message("An error occurred while processing your request. Please try again.", ephemeral=True)
         print(f"Database error: {e}")
     finally:
+        # Close the connection asynchronously
         if conn is not None:
-            conn.close()
+            await conn.close()
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Set your in-game name.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def gamename(interaction: discord.Interaction, name: str):
-    safe_name = psycopg2.extensions.adapt(name).getquoted().decode()
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
+    safe_name = asyncpg.escape_string(name)
+    
     try:
+        # Establish an asynchronous connection to the database
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+        
         # Update the gamename in the ranked_players table
-        cur.execute("""
+        query = """
             UPDATE ranked_players
-            SET gamename = %s
-            WHERE discordid = %s
-        """, (safe_name, interaction.user.id))
-        conn.commit()
+            SET gamename = $1
+            WHERE discordid = $2
+        """
+        await conn.execute(query, safe_name, interaction.user.id)
+        
         # Confirm the update to the user
         await interaction.response.send_message(f"Your in-game name has been set to: {safe_name}", ephemeral=True)
+        
+        # Rebuild the entered slash command for auditing
+        command_name = interaction.command.name
+        command_options = " ".join([f"{opt.name}={opt.value}" for opt in interaction.command.options])
+        entered_command = f"/{command_name} {command_options}"
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        if audit_channel:
+            audit_message = f"Player (ID: {interaction.user.id}) has executed: {entered_command}"
+            await audit_channel.send(audit_message)
+
     except Exception as e:
         print(f"Database error: {e}")
         await interaction.response.send_message("An error occurred while updating your in-game name.", ephemeral=True)
     finally:
-        cur.close()
-        conn.close()
+        if conn:
+            await conn.close()
+
+
 
 # Run the bot, maaan
 bot.run(TOKEN)
