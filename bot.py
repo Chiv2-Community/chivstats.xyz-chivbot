@@ -454,197 +454,194 @@ async def calculate_duo_elo(team1_elo, team2_elo, team1_score, team2_score):
 
 # Helper function to check if a duo team exists and create one if not
 async def check_or_create_duo_team(conn, playfabid1, playfabid2):
-    cur = conn.cursor()  # Create a cursor from the connection
     try:
         # Check if the team already exists
-        cur.execute("""
+        team = await conn.fetchrow("""
             SELECT id FROM duo_teams
-            WHERE (player1_id = %s AND player2_id = %s) OR (player1_id = %s AND player2_id = %s)
-            """, (playfabid1, playfabid2, playfabid2, playfabid1))
-        team = cur.fetchone()
+            WHERE (player1_id = $1 AND player2_id = $2) OR (player1_id = $2 AND player2_id = $1)
+            """, playfabid1, playfabid2)
 
         if not team:
             # Retrieve the display names of both players
-            player1_name = await get_display_name_from_ranked_players(cur, playfabid1)
-            player2_name = await get_display_name_from_ranked_players(cur, playfabid2)
+            player1_name = await get_display_name_from_ranked_players(playfabid1)
+            player2_name = await get_display_name_from_ranked_players(playfabid2)
 
             # Generate team name
-            part1 = player1_name[:4] if player1_name else "Unknown"
-            part2 = player2_name[:4] if player2_name else "Unknown"
-            team_name = f"{part1}_{part2}"
-
+            part1 = player1_name[:4] if player1_name else "Unk"
+            part2 = player2_name[:4] if player2_name else "Unk"
+            team_name = f"{part1}{part2}"
             # Create the new team with the generated team name and initial ELO rating
             initial_elo = 1500  # Example initial ELO rating
-            cur.execute("""
+            team_id = await conn.fetchval("""
                 INSERT INTO duo_teams (player1_id, player2_id, team_name, elo_rating)
-                VALUES (%s, %s, %s, %s) RETURNING id
-                """, (playfabid1, playfabid2, team_name, initial_elo))
-            team_id = cur.fetchone()[0]
-            conn.commit()
+                VALUES ($1, $2, $3, $4) RETURNING id
+                """, playfabid1, playfabid2, team_name, initial_elo)
             return team_id
         else:
-            return team[0]
+            return team['id']
 
     except Exception as e:
         print(f"Error in check_or_create_duo_team: {e}")
         raise e  # Re-raise the exception so that it can be handled by the calling function
-    finally:
-        cur.close()  # Close the cursor
+
+
+
+
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a 2v2 duel between two teams.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def submit_duo(interaction: discord.Interaction, team_member: discord.Member, team_score: int, 
                       enemy1: discord.Member, enemy2: discord.Member, enemy_score: int):
-    # Define static PlayFab IDs for debug mode
-    DEBUG_PLAYFAB_ID1 = "1947B51050FA8EAA"
-    DEBUG_PLAYFAB_ID2 = "E255D12F3C825F2D"
+    try: 
+        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
-    # Fetch PlayFab IDs for all members of both teams
-    team1_playfabid1 = await get_playfabid_of_discord_id(conn, team_member.id)
-    team1_playfabid2 = await get_playfabid_of_discord_id(conn, interaction.user.id)
-    team2_playfabid1 = await get_playfabid_of_discord_id(conn, enemy1.id)
-    team2_playfabid2 = await get_playfabid_of_discord_id(conn, enemy2.id)
-    # Check for duplicate players
-    players = [interaction.user, team_member, enemy1, enemy2]
-    if len(players) != len(set(player.id for player in players)):
-        await interaction.response.send_message("Duplicate players detected! Please ensure all players are unique.", ephemeral=True)
-        return
+        # Fetch PlayFab IDs for all members of both teams
+        team1_playfabid1 = await get_playfabid_of_discord_id(conn, interaction.user.id)
+        team1_playfabid2 = await get_playfabid_of_discord_id(conn, team_member.id)
+        team2_playfabid1 = await get_playfabid_of_discord_id(conn, enemy1.id)
+        team2_playfabid2 = await get_playfabid_of_discord_id(conn, enemy2.id)
+        command_text = f"/submit_duo @{interaction.user.display_name} & @{team_member.display_name} {team_score} vs @{enemy1.display_name} & @{enemy2.display_name} {enemy_score}"
 
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
+        # Check for duplicate players
+        players = [interaction.user, team_member, enemy1, enemy2]
+        if len(players) != len(set(player.id for player in players)):
+            await interaction.response.send_message("Duplicate players detected! Please ensure all players are unique.", ephemeral=True)
+            return
 
-    # Verify none of the players are retired
-    player_ids = [interaction.user.id, team_member.id, enemy1.id, enemy2.id]
-    cur.execute("SELECT discordid, retired FROM ranked_players WHERE discordid = ANY(%s)", (player_ids,))
-    results = cur.fetchall()
-    retired_players = [discord_id for discord_id, retired in results if retired]
+        # Verify none of the players are retired
+        player_ids = [interaction.user.id, team_member.id, enemy1.id, enemy2.id]
+        results = await conn.fetch("SELECT discordid, retired FROM ranked_players WHERE discordid = ANY($1)", player_ids)
+        retired_players = [discord_id for discord_id, retired in results if retired]
+        if retired_players:
+            message = "The following players are retired: "
+            message += ', '.join(f"<@{discord_id}>" for discord_id in retired_players)
+            message += "\nPlease reactivate your account using /reactivate."
+            await interaction.response.send_message(message, ephemeral=True)
+            return
 
-    if retired_players:
-        message = "The following players are retired: "
-        message += ', '.join(f"<@{discord_id}>" for discord_id in retired_players)
-        message += "\nPlease reactivate your account using /reactivate."
-        await interaction.response.send_message(message, ephemeral=True)
-        return
+        # Send an ephemeral response to the submitter to indicate the submission was accepted
+        await interaction.response.send_message("Submission accepted. Please wait for confirmation from the opposing team.", ephemeral=True)
 
-    # Fetch PlayFab IDs for both members of the team
-    team1_playfabid1 = await get_playfabid_of_discord_id(conn, interaction.user.id)
-    team1_playfabid2 = await get_playfabid_of_discord_id(conn, team_member.id)
-
-    # Fetch PlayFab IDs for the opposing team
-    team2_playfabid1 = await get_playfabid_of_discord_id(conn, enemy1.id)
-    team2_playfabid2 = await get_playfabid_of_discord_id(conn, enemy2.id)
-
-    try:
         # Check for existing teams or create new ones
         team1_id = await check_or_create_duo_team(conn, team1_playfabid1, team1_playfabid2)
         team2_id = await check_or_create_duo_team(conn, team2_playfabid1, team2_playfabid2)
-
         # Fetch current ELO ratings
-        cur.execute("SELECT elo_rating FROM duo_teams WHERE id = %s", (team1_id,))
-        team1_elo = cur.fetchone()[0]
-        cur.execute("SELECT elo_rating FROM duo_teams WHERE id = %s", (team2_id,))
-        team2_elo = cur.fetchone()[0]
+        team1_elo = await conn.fetchval("SELECT elo_rating FROM duo_teams WHERE id = $1", team1_id)
+        team2_elo = await conn.fetchval("SELECT elo_rating FROM duo_teams WHERE id = $1", team2_id)
 
-        # Calculate new ELO ratings
-        team1_new_elo, team2_new_elo = await calculate_duo_elo(team1_elo, team2_elo, team_score, enemy_score)
-
-        # Update the duo_teams table with new ELO ratings
-        cur.execute("UPDATE duo_teams SET elo_rating = %s WHERE id = %s", (team1_new_elo, team1_id))
-        cur.execute("UPDATE duo_teams SET elo_rating = %s WHERE id = %s", (team2_new_elo, team2_id))
-        conn.commit()
-
-        # Announce the result in the channel
-        result_message = (
-            f"Duel result submitted for verification:\n"
-            f"Team 1: <@{interaction.user.id}> and <@{team_member.id}> - Score: {team_score}\n"
-            f"Team 2: <@{enemy1.id}> and <@{enemy2.id}> - Score: {enemy_score}\n"
+        embed = discord.Embed(
+            title="2v2 Duel Result (UNVERIFIED)",
+            description=f"`{command_text}`\n\n"
+                        f"Team 1: <@{interaction.user.id}> and <@{team_member.id}> - Score: {team_score}\n"
+                        f"Team 2: <@{enemy1.id}> and <@{enemy2.id}> - Score: {enemy_score}",
+            color=discord.Color.orange()
         )
-        await interaction.response.send_message(result_message)
+
+        # Send the initial response message or edit if it already exists
+        sent_message = await interaction.channel.send(embed=embed)
+
+        # Add reactions to the sent message
+        await sent_message.add_reaction('✅')
+        await sent_message.add_reaction('❌')
+
+        def check(reaction, user):
+            if reaction.message.id != sent_message.id:
+                return False
+            # Check if the user is part of the opposing team
+            is_opposing_team = user.id in [enemy1.id, enemy2.id]
+            # Check if the user is part of the submitting team
+            is_submitting_team = user.id in [interaction.user.id, team_member.id]
+            # Allow '✅' and '❌' for opposing team members
+            if is_opposing_team and str(reaction.emoji) in ['✅', '❌']:
+                return True
+            # Allow only '❌' for submitting team members
+            elif is_submitting_team and str(reaction.emoji) == '❌':
+                return True
+            # Ignore other reactions and users not part of the teams
+            return False
+
+        try:
+            # Wait for a valid reaction from the opposing team
+            reaction, user = await bot.wait_for('reaction_add', timeout=3600.0, check=check)
+            if str(reaction.emoji) == '✅':
+
+                # Calculate new ELO ratings
+                team1_new_elo, team2_new_elo = await calculate_duo_elo(team1_elo, team2_elo, team_score, enemy_score)
+
+                # Update the duo_teams table with new ELO ratings
+                await conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team1_new_elo, team1_id)
+                await conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team2_new_elo, team2_id)
+                # Fetch team names
+                team1_name = await conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", team1_id)
+                team2_name = await conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", team2_id)
+
+                # Calculate ELO changes
+                team1_elo_change = int(team1_new_elo - team1_elo)
+                team2_elo_change = int(team2_new_elo - team2_elo)
+                team1_new_elo_rounded = round(team1_new_elo)
+                team2_new_elo_rounded = round(team2_new_elo)
+
+                # Format ELO changes for display
+                team1_elo_change_str = f"({team1_elo_change:+})" if team1_elo_change != 0 else "(±0)"
+                team2_elo_change_str = f"({team2_elo_change:+})" if team2_elo_change != 0 else "(±0)"
+
+                # Update the embed with the new ELO ratings
+                embed.title = "2v2 Duel Result Confirmed"
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Match result confirmed by {user.display_name}.")
+
+                # Determine the winning team and set labels accordingly
+                if team_score > enemy_score:
+                    submitting_team_label = "Winners"
+                    opposing_team_label = "Losers"
+                else:
+                    submitting_team_label = "Losers"
+                    opposing_team_label = "Winners"
+                embed.add_field(name=f"{submitting_team_label} - {team1_name} ELO: {team1_new_elo_rounded} {team1_elo_change_str}", value=f"<@{interaction.user.id}> (submitter) and <@{team_member.id}>", inline=False)
+                embed.add_field(name=f"{opposing_team_label} - {team2_name} ELO: {team2_new_elo_rounded} {team2_elo_change_str}", value=f"<@{enemy1.id}> and <@{enemy2.id}>", inline=False)
+                await sent_message.edit(embed=embed)
+
+            elif str(reaction.emoji) == '❌':
+                # Process the duel result as denied
+                await sent_message.edit(content=f"Duel result denied by {user.display_name}.", embed=None)
+
+        except asyncio.TimeoutError:
+            await sent_message.edit(content="Duel confirmation timed out.", embed=None)
+        finally:
+            # Clear reactions after processing
+            try:
+                await sent_message.clear_reactions()
+            except discord.errors.Forbidden:
+                pass
 
     except Exception as e:
         # Handle exceptions and possibly roll back
         print(f"Error in submit_duo: {e}")
-        conn.rollback()  # Roll back in case of error
+        await conn.execute('ROLLBACK')
     finally:
         # Ensure the connection is closed
-        cur.close()
-        conn.close()
+        await conn.close()
 
-@bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a 2v2 duel between two teams in debug mode.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def submit_duos_debug(interaction: discord.Interaction, team_score: int, enemy1: discord.Member, enemy_score: int):
-    # Define static PlayFab IDs for debug mode
-    DEBUG_PLAYFAB_ID1 = "1947B51050FA8EAA"
-    DEBUG_PLAYERID1 = "540028116"
-    DEBUG_PLAYFAB_ID2 = "E255D12F3C825F2D"
-    DEBUG_PLAYERID2 = "334904333"
 
-    # Establish a database connection at the start of the function
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
 
-    # Using debug PlayFab IDs for testing
-    team1_playfabid1 = await get_playfabid_of_discord_id(cur, interaction.user.id)
-    team1_playfabid2 = DEBUG_PLAYFAB_ID1  # Debug PlayFab ID for team member
-    team2_playfabid1 = await get_playfabid_of_discord_id(cur, enemy1.id)  # Resolve enemy1 to a real Discord ID
-    team2_playfabid2 = DEBUG_PLAYFAB_ID2  # Debug PlayFab ID for enemy2
 
-    
-    try:
-        # Check for existing teams or create new ones
-        team1_id = await check_or_create_duo_team(conn, team1_playfabid1, DEBUG_PLAYFAB_ID1)
-        team2_id = await check_or_create_duo_team(conn, team2_playfabid1, DEBUG_PLAYFAB_ID2)
-
-        # Fetch current ELO ratings
-        cur.execute("SELECT elo_rating FROM duo_teams WHERE id = %s", (team1_id,))
-        team1_elo = cur.fetchone()[0]
-        cur.execute("SELECT elo_rating FROM duo_teams WHERE id = %s", (team2_id,))
-        team2_elo = cur.fetchone()[0]
-
-        # Calculate new ELO ratings
-        team1_new_elo, team2_new_elo = await calculate_duo_elo(team1_elo, team2_elo, team_score, enemy_score)
-
-        # Update the duo_teams table with new ELO ratings
-        cur.execute("UPDATE duo_teams SET elo_rating = %s WHERE id = %s", (team1_new_elo, team1_id))
-        cur.execute("UPDATE duo_teams SET elo_rating = %s WHERE id = %s", (team2_new_elo, team2_id))
-        conn.commit()
-
-        # Announce the result in the channel
-        result_message = (
-            f"Duel result submitted for verification in debug mode:\n"
-            f"Team 1 (Debug): <@{interaction.user.id}> and Debug Player - Score: {team_score}\n"
-            f"Team 2: <@{enemy1.id}> and Debug Player 2 - Score: {enemy_score}\n"
-        )
-        await interaction.response.send_message(result_message)
-
-    except Exception as e:
-        # Handle exceptions and possibly roll back
-        print(f"Error in submit_duos_debug: {e}")
-        await interaction.response.send_message("An error occurred while submitting the duel.", ephemeral=True)
-        conn.rollback()  # Roll back in case of error
-    finally:
-        # Ensure the connection is closed
-        cur.close()
-        conn.close()
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Create and or update your duos team name.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def duo_setup_team(interaction: discord.Interaction, team_member: discord.Member, team_name: str, debug: bool = False):
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
+    conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
     # Fetch PlayFab IDs for both members of the team
     playfabid1 = await get_playfabid_of_discord_id(conn, interaction.user.id)  # Assuming this is not an async function
     playfabid2 = await get_playfabid_of_discord_id(conn, team_member.id)      # Assuming this is not an async function
 
     try:
-        with conn.cursor() as cur:
-            # Check for an existing team or create a new one
-            team_id = check_or_create_duo_team(conn, playfabid1, playfabid2)  # Assuming this is not an async function
+        # Check for an existing team or create a new one
+        team_id = await check_or_create_duo_team(conn, playfabid1, playfabid2)  # Assuming this is not an async function
 
-            # Update the team name
-            cur.execute("UPDATE duo_teams SET team_name = %s WHERE id = %s", (team_name, team_id))
-            conn.commit()
+        # Update the team name
+        await conn.execute("UPDATE duo_teams SET team_name = $1 WHERE id = $2", team_name, team_id)
 
         # Announce the update
         await interaction.response.send_message(f"Team name set to '{team_name}'.", ephemeral=True)
@@ -654,23 +651,22 @@ async def duo_setup_team(interaction: discord.Interaction, team_member: discord.
         await interaction.response.send_message("An error occurred while processing your request.", ephemeral=True)
 
     finally:
-        conn.close()
+        await conn.close()
 
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="List all duo teams, their players, and ELO ranks in descending order.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def duo_teams(interaction: discord.Interaction):
-    conn = psycopg2.connect(database=DATABASE, user=USER, host=HOST)
-    cur = conn.cursor()
+    conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
     try:
-        # Query all duo teams with their ELO rating, ordered by ELO in descending order
-        cur.execute("""
+        # Query all active duo teams with their ELO rating, ordered by ELO in descending order
+        teams = await conn.fetch("""
             SELECT team_name, player1_id, player2_id, elo_rating, ROW_NUMBER() OVER (ORDER BY elo_rating DESC)
             FROM duo_teams
+            WHERE retired = false
         """)
-        teams = cur.fetchall()
 
         if not teams:
             await interaction.response.send_message("There are currently no duo teams registered.", ephemeral=True)
@@ -702,8 +698,8 @@ async def duo_teams(interaction: discord.Interaction):
         print(f"Error in duo_teams: {e}")
         await interaction.response.send_message("An error occurred while retrieving the duo teams.", ephemeral=True)
     finally:
-        if conn:
-            conn.close()
+        await conn.close()
+
 ##########END OF DUOS#############
 
 
