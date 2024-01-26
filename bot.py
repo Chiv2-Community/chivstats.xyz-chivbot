@@ -19,7 +19,11 @@ HOST = "/var/run/postgresql"
 # URL for the duels leaderboard and list of Discord guild IDs where the bot is active.
 # Not including guild ids causes a delay in command update replication.
 DUELS_LEADERBOARD_URL = "https://chivstats.xyz/leaderboards/ranked_combat/" 
-GUILD_IDS = [1111684756896239677, 878005964685582406, 1163168644524687394, 1117929297471094824]
+GUILD_IDS = [1111684756896239677, #unchained @gimmic
+             878005964685582406, #Tournament grounds @funk
+             1163168644524687394, #Goblins @short
+             1108303022834069554,#Divided Loyalty @chillzone
+                ]
 #Legacy 1117929297471094824
 
 # Send an audit message to a specific guild and channel
@@ -282,11 +286,145 @@ async def admin_register(interaction: discord.Interaction, member: discord.Membe
         # Close the database connection
         await close_db_connection(conn)
 
+@bot.slash_command(guild_ids=GUILD_IDS, description="Display the top 10 leaderboard for duels or duos.")
+@is_channel_named(['chivstats-ranked', 'chivstats-test'])
+async def leaderboard(interaction: discord.Interaction, category: str):
+    # Validate category input
+    if category.lower() not in ['duel', 'duels', 'duo', 'duos']:
+        await interaction.response.send_message("Invalid category. Please enter 'duel(s)' for duel leaderboard or 'duo(s)' for duo leaderboard.", ephemeral=True)
+        return
 
+    # Defer the interaction to have more time for processing
+    await interaction.response.defer()
+
+    conn = await create_db_connection()
+    try:
+        embed = discord.Embed(title=f"{category.title()} Leaderboard", color=discord.Color.blue())
+
+        if category.lower() in ['duel', 'duels']:
+            # Fetch the top 10 duel players
+            players = await conn.fetch("""
+                SELECT discordid, elo_duelsx, playfabid FROM ranked_players
+                WHERE retired = FALSE
+                ORDER BY elo_duelsx DESC
+                LIMIT 10
+            """)
+
+            tier_assignments = await calculate_tiers(conn)
+            embed = discord.Embed(title=f"{category.title()} Leaderboard", color=discord.Color.blue())
+
+            leaderboard_lines = []
+            for index, player in enumerate(players, 1):
+                discord_id = player['discordid']
+                playfabid = player['playfabid']
+                elo_rating = round(player['elo_duelsx'])  # Round the ELO rating
+                tier_emoji = tier_assignments.get(playfabid, '❓')  # Get tier emoji
+                discord_name = await get_discord_name_from_id(interaction.guild, discord_id)  # Fetch the display name
+
+                # Format each line with fixed width for ELO rating and tier emoji
+                leaderboard_line = f"{index}. {tier_emoji} {discord_name} - {elo_rating}"
+                leaderboard_lines.append(leaderboard_line)
+
+            # Combine all lines into a single string with line breaks
+            leaderboard_text = "\n".join(leaderboard_lines)
+            embed.description = leaderboard_text
+
+            # Send the embed
+            await interaction.followup.send(embed=embed)
+
+        # For duos
+        elif category.lower() in ['duo', 'duos']:
+            # Fetch the top 10 duo teams along with their players' discord IDs
+            teams = await conn.fetch("""
+                SELECT dt.team_name, dt.elo_rating, rp1.discordid as player1_discordid, rp2.discordid as player2_discordid
+                FROM duo_teams dt
+                JOIN ranked_players rp1 ON dt.player1_id = rp1.playfabid
+                JOIN ranked_players rp2 ON dt.player2_id = rp2.playfabid
+                WHERE dt.retired = FALSE
+                ORDER BY dt.elo_rating DESC
+                LIMIT 10
+            """)
+
+            rank_tier = [f"{index}." for index, _ in enumerate(teams, 1)]
+            team_names = [team['team_name'] for team in teams]
+            elos = [str(team['elo_rating']) for team in teams]
+            player_names = [f"{await get_discord_name_from_id(interaction.guild, team['player1_discordid'])} & {await get_discord_name_from_id(interaction.guild, team['player2_discordid'])}" for team in teams]
+
+            embed.add_field(name="#", value="\n".join(rank_tier), inline=True)
+            embed.add_field(name="Team", value="\n".join(team_names), inline=True)
+            embed.add_field(name="Players", value="\n".join(player_names), inline=True)
+
+        # Send the embed
+        await interaction.followup.send(embed=embed)
+    finally:
+        await close_db_connection(conn)
+
+async def get_discord_name_from_id(guild, discord_id):
+    # Fetch the member from the guild using the discord ID
+    member = guild.get_member(discord_id)
+    # Return the member's display name if found, else 'Unknown'
+    return member.display_name if member else 'Unknown'
 
 
 ##################
 #ELO Duel related code
+async def calculate_tiers(conn):
+    # Fetch all active players' ELO scores
+    active_players = await conn.fetch(
+        "SELECT playfabid, elo_duelsx FROM ranked_players WHERE retired = FALSE ORDER BY elo_duelsx DESC"
+    )
+
+    # Extract ELO scores into a list
+    elo_scores = [(player['playfabid'], player['elo_duelsx']) for player in active_players]
+
+    # Calculate the total number of active players
+    total_players = len(elo_scores)
+    print(f"Total active players: {total_players}")
+
+    # Use actual Discord emoji in tier assignments instead of the colon format
+    tier_assignments = {
+        elo_scores[0][0]: '🥇',  # first place medal
+        elo_scores[1][0]: '🥈',  # second place medal
+        elo_scores[2][0]: '🥉'   # third place medal
+    }
+    emoji_mapping = {
+        ':regional_indicator_s:': '🇸',  # regional indicator symbol letter S
+        ':regional_indicator_a:': '🇦',  # regional indicator symbol letter A
+        ':regional_indicator_b:': '🇧',  # regional indicator symbol letter B
+        ':regional_indicator_c:': '🇨',  # regional indicator symbol letter C
+        ':regional_indicator_d:': '🇩'   # regional indicator symbol letter D
+    }
+    # Adjust the list of active players to exclude the top 3 for tier calculations
+    remaining_players = elo_scores[3:]
+
+    # Define the percentage cutoffs for each tier
+    tier_cutoffs = {
+        ':regional_indicator_s:': 0.10,
+        ':regional_indicator_a:': 0.20,
+        ':regional_indicator_b:': 0.50,
+        ':regional_indicator_c:': 0.80,
+        ':regional_indicator_d:': 1.00  # 100% for the remaining players
+    }
+
+    # Calculate the index cutoffs based on the percentage
+    tier_indices = {tier: int(percentage * (total_players - 3)) for tier, percentage in tier_cutoffs.items()}  # Adjust for top 3
+
+    # Assign tiers to each remaining player based on their ELO score
+    current_index = 0
+    for tier, index_cutoff in tier_indices.items():
+        while current_index < index_cutoff:
+            if current_index < len(remaining_players):
+                playfabid, elo_score = remaining_players[current_index]
+                tier_assignments[playfabid] = emoji_mapping[tier]
+                current_index += 1
+            else:
+                break
+
+    # Debug print to check the final assignments
+    print(f"Final tier assignments: {tier_assignments}")
+
+    return tier_assignments
+
 async def log_duel(conn, submitting_playfabid, winner_playfabid, winner_score, winner_elo, loser_playfabid, loser_score, loser_elo):
     try:
         await conn.execute("""
@@ -319,6 +457,9 @@ def calculate_elo(R, K, games_won, games_played, opponent_rating, c=400):
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def submit_duel(interaction: discord.Interaction, initiator: discord.Member, initiator_score: int, opponent: discord.Member, opponent_score: int):
     await interaction.response.defer()  # Defer the response to process the command
+    test_channel_message = None  # Initialize a variable to hold the test channel message reference
+    duel_message = None  # Initialize duel_message to None here, outside the if-else block
+    guild_names_sent_to = []
     try:
         if initiator.id == opponent.id:
             await interaction.followup.send("You cannot duel yourself!", ephemeral=True)
@@ -363,15 +504,18 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
         audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
 
         if audit_channel:
-            audit_message = f"Player {interaction.user.display_name} (ID: {interaction.user.id}) has executed: {entered_command}"
+            audit_message = f"Player {interaction.user.display_name} (ID: {interaction.user.id}) has executed: {entered_command} from {interaction.guild.name}"
             await audit_channel.send(audit_message)
 
         embed = discord.Embed(title="Duel Result (UNVERIFIED)", description=f"Command: `{command_text}`", color=discord.Color.orange())
         embed.add_field(name="Matchup", value=f"{winner.display_name}{winner_label} vs {loser.display_name}{submitter_label}", inline=False)
         embed.add_field(name="Score", value=f"{winner_score}-{loser_score}", inline=True)
 
-        user_to_verify = opponent if interaction.user == initiator else initiator
         duel_message = await interaction.followup.send(embed=embed)
+        duel_message_id = duel_message.id  # Save the message ID for later reference
+
+        user_to_verify = opponent if interaction.user == initiator else initiator
+
         cst_timezone = pytz.timezone('America/Chicago')
         current_time_cst = datetime.now(pytz.utc).astimezone(cst_timezone)
         expiration_time_cst = current_time_cst + timedelta(minutes=60)
@@ -397,7 +541,6 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
                 return str(reaction.emoji) == '❌'  # Submitter can only deny
             else:
                 return False  # Ignore other users
-
         try:
             reaction, user = await bot.wait_for('reaction_add', timeout=3600.0, check=check)
             if str(reaction.emoji) == '✅':
@@ -443,29 +586,83 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
                             await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
 
                     total_reward = coin_reward + payout_amount
-                    embed = discord.Embed(title=f"1v1 Duel Winner: {winner.display_name}", description=f"Command: `{command_text}`\n\nView the updated rankings on the [chivstats.xyz Ranked Leaderboards]({DUELS_LEADERBOARD_URL}).", color=discord.Color.green())
-                    embed.set_footer(text=f"Match result confirmed by {user.display_name}.")
-                    embed.add_field(name="Winner's New ELO", value=f"{winner.display_name}: {round(new_winner_elo_exact)} ({winner_elo_change_formatted})", inline=True)
-                    embed.add_field(name="Loser's New ELO", value=f"{loser.display_name}: {round(new_loser_elo_exact)} ({loser_elo_change_formatted})", inline=True)
-                    embed.add_field(name=f"Coin Reward [+{total_reward} :coin:]", value=f"Both fighters paid {coin_reward} coin, with a +{payout_amount} house bonus.", inline=False)
-                    await duel_message.edit(embed=embed)
-                    original_channel = interaction.channel
-                    # Iterate through each guild the bot is a part of
-                    channels_sent = 0
-                    for guild in bot.guilds:
-                        # Find the #chivstats-ranked channel
-                        channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
-                        if channel and channel != original_channel:
-                            try:
-                                embed_copy = embed.copy()
-                                await asyncio.sleep(0.5)  # Add a 500ms delay
-                                await channel.send(embed=embed_copy)
-                                channels_sent += 1
-                            except Exception as e:
-                                print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
-                    if audit_channel:
-                        audit_message = f"Duel echoed to {channels_sent} channels."
-                        await audit_channel.send(audit_message)
+                    command_text = f"cmd: `/submit_duel @{winner.display_name} {winner_score} @{loser.display_name} {loser_score}`"
+                    # ELO rounded values
+                    winner_elo_rounded = round(new_winner_elo_exact)
+                    loser_elo_rounded = round(new_loser_elo_exact)
+                    # Calculate the new tier assignments
+                    tier_assignments = await calculate_tiers(conn)
+
+                    # Retrieve the tier emojis for the winner and loser
+                    winner_tier_emoji = tier_assignments.get(winner_playfabid, ':regional_indicator_d:')
+                    loser_tier_emoji = tier_assignments.get(loser_playfabid, ':regional_indicator_d:')
+
+                    # Fetch the updated ELO and purse values for the embed
+                    updated_winner_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", winner.id)
+                    updated_loser_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", loser.id)
+
+                    updated_winner_elo, updated_winner_purse = updated_winner_data['elo_duelsx'], updated_winner_data['coins']
+                    updated_loser_elo, updated_loser_purse = updated_loser_data['elo_duelsx'], updated_loser_data['coins']
+
+                    # Construct the embed with the updated values
+                    updated_embed = discord.Embed(
+                        title=f"1v1 Duel Winner: {winner.display_name} vs {loser.display_name} ({winner_score}-{loser_score})",
+                        color=discord.Color.green()
+                    )
+                    updated_embed.add_field(
+                        name=f"{winner.display_name}: {round(updated_winner_elo)} ({winner_elo_change_formatted})",
+                        value=f"{winner_tier_emoji} Tier   :coin: {updated_winner_purse}", 
+                        inline=True
+                    )
+                    updated_embed.add_field(
+                        name=f"{loser.display_name}: {round(updated_loser_elo)} ({loser_elo_change_formatted})",
+                        value=f"{loser_tier_emoji} Tier   :coin: {updated_loser_purse}", 
+                        inline=True
+                    )
+
+                    updated_embed.set_footer(text=f"Match result confirmed by {user.display_name}")
+                    updated_embed.timestamp = datetime.now()
+                    # Construct the description with Participation Reward and Purse as line items
+                    description_lines = [
+                        f"`/submit_duel @{initiator.display_name} {initiator_score} @{opponent.display_name} {opponent_score}`",
+                        f"Payout: **{total_reward}** [ {coin_reward} + ({payout_amount} house tip) ]",
+                        f"Purse: 0" 
+                    ]
+                    updated_embed.description = "\n".join(description_lines)
+
+                    # Set the URL for the leaderboard
+                    updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
+
+                    # Check if the duel was initiated in the test channel
+                    if interaction.channel.name == 'chivstats-test':
+                        # If it is, update the test channel message or send a new message if it doesn't exist
+                        await duel_message.edit(embed=updated_embed)
+                    else:
+                        # Fetch the original message by ID before editing
+                        duel_message = await interaction.channel.fetch_message(duel_message_id)
+                        await duel_message.edit(embed=updated_embed)  # Update the original message
+
+                        # Echo the updated result to other channels named 'chivstats-ranked'
+                        for guild in bot.guilds:
+                            channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+                            if channel and channel.id != interaction.channel.id:  # Ensure we don't send it to the original channel
+                                try:
+                                    # Use the updated embed with confirmed results
+                                    embed_copy = updated_embed.copy()  
+                                    # Remove user mentions to avoid highlighting users in other guilds
+                                    embed_copy.description = embed_copy.description.replace(f"@{initiator.display_name}", initiator.display_name).replace(f"@{opponent.display_name}", opponent.display_name)
+                                    await asyncio.sleep(0.5)  # Add a 500ms delay to avoid rate limiting
+                                    await channel.send(embed=embed_copy)
+                                    guild_names_sent_to.append(guild.name)  # Add the name of the guild to the list
+                                except Exception as e:
+                                    print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
+
+                        if audit_channel:
+                            if guild_names_sent_to:
+                                audit_message = f"Duel echoed to the following guilds: {', '.join(guild_names_sent_to)}"
+                            else:
+                                audit_message = "Duel was not echoed to any other guilds."
+                            await audit_channel.send(audit_message)
                     await verification_message.delete()
                 else:
                     await interaction.followup.send("One or both players are not registered in the ranking system.", ephemeral=True)
@@ -1384,61 +1581,57 @@ import re
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def status(interaction: discord.Interaction, player_details: str):
     await interaction.response.defer()  # Defer the response
-
+    
+    if not player_details:
+        await interaction.followup.send("No player details provided. Please use the command with a PlayFab ID or Discord mention.", ephemeral=True)
+        return
+    
     conn = None  # Initialize conn to None before the try block
 
     try:
         # Establish an asynchronous connection to the database
         conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+        discord_id, playfabid, retired = None, None, None
 
-        # Use regular expression to determine if player_details is a Discord mention
-        discord_mention_match = re.match(r"<@!?(\d+)>", player_details)
-        if discord_mention_match:
-            # The player_details is a Discord mention
-            discord_id = int(discord_mention_match.group(1))
+        # Use regular expression to check if player_details is a Discord mention
+        if re.match(r"<@!?(\d+)>", player_details):
+            discord_id = re.findall(r'\d+', player_details)[0]
             query = "SELECT playfabid, retired FROM ranked_players WHERE discordid = $1"
-            result = await conn.fetchrow(query, discord_id)
+            result = await conn.fetchrow(query, int(discord_id))
         else:
-            # The player_details is assumed to be a PlayFab ID
+            playfabid = player_details
             query = "SELECT discordid, retired FROM ranked_players WHERE playfabid = $1"
-            result = await conn.fetchrow(query, player_details)
+            result = await conn.fetchrow(query, playfabid)
 
         if result:
-            # Retrieved data based on Discord ID or PlayFab ID
-            linked_discord_id = result.get('discordid')
-            playfabid = result.get('playfabid')
             retired = result['retired']
             retirement_status = "Retired" if retired else "Active"
-            if playfabid:
-                # Discord ID was used to find the account
-                playfab_link = f"https://chivstats.xyz/leaderboards/player/{playfabid}/"
-                description = f"Discord account <@{discord_id}> is linked to PlayFab ID [View Profile]({playfab_link}). Status: {retirement_status}."
+            if discord_id:
+                playfabid = result['playfabid']  # Extract PlayFab ID
             else:
-                # PlayFab ID was used to find the account
-                description = f"PlayFab ID {player_details} is linked to Discord account: <@{linked_discord_id}>. Status: {retirement_status}."
-
-            embed = discord.Embed(
-                title="Account Status",
-                description=description,
-                color=discord.Color.green() if not retired else discord.Color.greyple()
-            )
+                discord_id = result['discordid']  # Extract Discord ID
+            
+            # Embed the PlayFab ID with a hyperlink to the ChivStats profile
+            description = (f"Discord account <@{discord_id}> is linked to PlayFab ID "
+                           f"[{playfabid}](https://chivstats.xyz/leaderboards/player/{playfabid}/). "
+                           f"Status: {retirement_status}.")
         else:
-            # No result was found
-            embed = discord.Embed(
-                title="Account Status",
-                description="No player found with the provided identifier.",
-                color=discord.Color.red()
-            )
-        
+            description = "No player found with the provided identifier."
+
+        # Prepare the embed with a link to the player's ChivStats profile
+        embed = discord.Embed(
+            title="Account Status",
+            description=description,
+            color=discord.Color.green() if not retired else discord.Color.greyple()
+        )
+
         # Send the followup message
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        print(f"Database error: {type(e).__name__}, {e}")
         await interaction.followup.send("An error occurred while processing your request.", ephemeral=True)
 
     finally:
-        # Ensure the connection is closed if it was established
         if conn:
             await conn.close()
 
@@ -1477,7 +1670,12 @@ async def register(interaction: discord.Interaction, playfabid: str):
         query = "SELECT discordid FROM ranked_players WHERE playfabid = $1"
         linked_discord_id = await conn.fetchval(query, playfabid)
         if linked_discord_id and linked_discord_id != interaction.user.id:
-            await interaction.followup.send("This PlayFab ID is already linked to another Discord account.", ephemeral=True)
+            # If the PlayFab ID is already linked
+            error_message = (
+                f"⚠️ {interaction.user.mention}, the provided PlayFab ID `{playfabid}` is already linked to another Discord account. "
+                "If you believe this is an error, please mention it in the #chivstats-ranked channel."
+            )
+            await interaction.followup.send(error_message, ephemeral=True)
             return
 
         # Check if Discord account already linked to a different PlayFab ID
@@ -1522,6 +1720,14 @@ async def register(interaction: discord.Interaction, playfabid: str):
             color=discord.Color.green()
         )
         await interaction.followup.send(embed=embed)
+
+        # After successful registration in your register command
+        confirmation_message = (
+            f"✅ {interaction.user.mention}, you have successfully registered with the PlayFab ID `{playfabid}`. "
+            "You are now ready to participate in ranked matches! "
+            "Use `/status` anytime to check your registration status."
+        )
+        await interaction.followup.send(confirmation_message, ephemeral=True)
 
         # Rebuild the entered slash command for auditing
         command_name = interaction.command.name
