@@ -452,6 +452,204 @@ def calculate_elo(R, K, games_won, games_played, opponent_rating, c=400):
     new_rating = R + K * (actual_score - expected_score)
     return new_rating  # Return as float for precise calculation
 
+class ConfirmationView(discord.ui.View):
+    def __init__(self, initiator_id: int, opponent_id: int, duel_message, winner_id: int, loser_id: int, winner_score: int, loser_score: int, verification_message=None, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
+        self.initiator_id = initiator_id
+        self.opponent_id = opponent_id
+        self.duel_message = duel_message
+        self.winner_id = winner_id
+        self.loser_id = loser_id
+        self.winner_score = winner_score
+        self.loser_score = loser_score
+        self.verification_message = verification_message
+
+
+    def clear_buttons(self):
+        self.clear_items()
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+    async def confirm_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # Only the opponent can confirm
+        if interaction.user.id == self.opponent_id:
+            await self.handle_confirm(interaction)
+        else:
+            await interaction.response.send_message("You are not authorized to confirm this duel.", ephemeral=True)
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
+    async def deny_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # Both the submitter and the opponent can deny
+        if interaction.user.id in [self.initiator_id, self.opponent_id]:
+            await self.handle_deny(interaction)
+        else:
+            await interaction.response.send_message("You are not authorized to deny this duel.", ephemeral=True)
+
+    async def handle_deny(self, interaction: discord.Interaction):
+        # Logic to handle denial
+        # Update the duel message to reflect the denial
+        # Disable buttons
+        self.clear_buttons()
+
+        # Fetch the initiator and opponent's display names
+        initiator_name = interaction.guild.get_member(self.initiator_id).display_name
+        opponent_name = interaction.guild.get_member(self.opponent_id).display_name
+
+        # Prepare the updated embed
+        updated_embed = discord.Embed(
+            title="Duel Cancelled",
+            description=f"Duel between {initiator_name} and {opponent_name} has been cancelled by {interaction.user.display_name}.",
+            color=discord.Color.red()
+        )
+        await self.duel_message.edit(embed=updated_embed, view=self)
+
+        if self.verification_message:
+            await self.verification_message.delete()
+        # Send a response message to the interaction
+        await interaction.response.send_message("Duel cancelled.", ephemeral=True)
+
+    def disable_all_buttons(self):
+        for item in self.children:
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+    async def handle_confirm(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        # Open a database connection
+        conn = await create_db_connection()
+
+        # Send an audit message to a specific guild and channel
+        target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
+        audit_channel_id = 1196358290066640946  # ID of the '#chivstats-audit' channel
+
+        # Get the target guild and channel
+        target_guild = bot.get_guild(target_guild_id)
+        audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
+
+        # Fetch ELO and PlayFab IDs for winner and loser
+        winner_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", self.winner_id)
+        loser_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", self.loser_id)
+
+        if winner_data and loser_data:
+            winner_playfabid, winner_rating = winner_data
+            loser_playfabid, loser_rating = loser_data
+
+            # Calculate new ELOs
+            new_winner_elo_exact = calculate_elo(winner_rating, 32, 1, 1, loser_rating)
+            new_loser_elo_exact = calculate_elo(loser_rating, 32, 0, 1, winner_rating)
+
+            # ELO changes
+            winner_elo_change = round(new_winner_elo_exact - winner_rating)
+            loser_elo_change = round(new_loser_elo_exact - loser_rating)
+            winner_elo_change_formatted = f"+{winner_elo_change}" if winner_elo_change >= 0 else f"{winner_elo_change}"
+            loser_elo_change_formatted = f"+{loser_elo_change}" if loser_elo_change >= 0 else f"{loser_elo_change}"
+            submitting_playfabid = winner_playfabid if interaction.user.id == self.winner_id else loser_playfabid
+
+            # Log the duel
+            await log_duel(conn, submitting_playfabid, winner_playfabid, self.winner_score, new_winner_elo_exact, loser_playfabid, self.loser_score, new_loser_elo_exact)
+
+            # Update Kills, Deaths, ELO score, and matches count
+            await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2, elo_duelsx = $3, matches = matches + 1 WHERE discordid = $4", self.winner_score, self.loser_score, new_winner_elo_exact, self.winner_id)
+            await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2, elo_duelsx = $3, matches = matches + 1 WHERE discordid = $4", self.loser_score, self.winner_score, new_loser_elo_exact, self.loser_id)
+
+#######            # Handle coin rewards and house account updates (if applicable)
+#####            # ... (Your existing logic for coin rewards and house account updates)
+###            # static coin reward?
+            coin_reward = 3
+            await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE playfabid = ANY($2::text[])", coin_reward, [winner_playfabid, loser_playfabid])
+
+            house_account_result = await conn.fetchrow("SELECT balance, payout_rate FROM house_account ORDER BY id DESC LIMIT 1")
+            house_balance, payout_rate_percentage = house_account_result if house_account_result else (0, 0)
+            payout_rate_percentage /= 100
+
+            payout_amount = 0
+            new_house_balance = house_balance
+            if house_balance > 0 and payout_rate_percentage > 0:
+                payout_amount = round(house_balance * payout_rate_percentage)
+                if house_balance >= payout_amount * 2:
+                    new_house_balance = house_balance - (payout_amount * 2)
+                    await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE discordid = ANY($2::bigint[])", payout_amount, [self.winner_id, self.loser_id])
+                    await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
+
+            total_reward = coin_reward + payout_amount
+
+            # Fetch updated ELO and purse values
+            updated_winner_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", self.winner_id)
+            updated_loser_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", self.loser_id)
+
+            updated_winner_elo, updated_winner_purse = updated_winner_data['elo_duelsx'], updated_winner_data['coins']
+            updated_loser_elo, updated_loser_purse = updated_loser_data['elo_duelsx'], updated_loser_data['coins']
+            tier_assignments = await calculate_tiers(conn)
+            # Retrieve the tier emojis for the winner and loser
+            winner_tier_emoji = tier_assignments.get(winner_playfabid, ':regional_indicator_d:')
+            loser_tier_emoji = tier_assignments.get(loser_playfabid, ':regional_indicator_d:')
+
+
+            # Create and send the updated embed
+            updated_embed = discord.Embed(
+                title=f"1v1 Duel Winner: {interaction.guild.get_member(self.winner_id).display_name} vs {interaction.guild.get_member(self.loser_id).display_name} ({self.winner_score}-{self.loser_score})",
+                color=discord.Color.green()
+            )
+            updated_embed.add_field(name=f"{interaction.guild.get_member(self.winner_id).display_name}: {round(updated_winner_elo)} ({winner_elo_change_formatted})", value=f"{winner_tier_emoji}   :coin: {updated_winner_purse}", inline=True)
+            updated_embed.add_field(name=f"{interaction.guild.get_member(self.loser_id).display_name}: {round(updated_loser_elo)} ({loser_elo_change_formatted})", value=f"{loser_tier_emoji}   :coin: {updated_loser_purse}", inline=True)
+            updated_embed.set_footer(text=f"Match result confirmed by {interaction.user.display_name}")
+            updated_embed.timestamp = datetime.now()
+
+            total_reward = coin_reward + payout_amount
+
+            # Construct the description with Participation Reward and Purse as line items
+            description_lines = [
+                f"`/submit_duel @{interaction.guild.get_member(self.initiator_id).display_name} {self.winner_score} @{interaction.guild.get_member(self.opponent_id).display_name} {self.loser_score}`",
+                f"Payout: **{total_reward}** [ {coin_reward} + ({payout_amount} house tip) ]",
+                f"Purse: 0"  # Placeholder, replace with actual purse logic if necessary
+            ]
+            updated_embed.description = "\n".join(description_lines)
+
+            # Set the URL for the leaderboard
+            updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
+
+            # Update the original message
+            await self.duel_message.edit(embed=updated_embed)
+
+            # Echo the updated result to other channels named 'chivstats-ranked'
+            guild_names_sent_to = []
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+                if channel and channel.id != interaction.channel.id:
+                    try:
+                        embed_copy = updated_embed.copy()
+                        #await asyncio.sleep(0.5)
+                        await channel.send(embed=embed_copy)
+                        guild_names_sent_to.append(guild.name)
+                    except Exception as e:
+                        print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
+
+            if guild_names_sent_to:
+                audit_message = f"Duel echoed to the following guilds: {', '.join(guild_names_sent_to)}"
+            else:
+                audit_message = "Duel was not echoed to any other guilds."
+            await audit_channel.send(audit_message)
+
+            # Update the original message
+            await self.duel_message.edit(embed=updated_embed)
+
+            if self.verification_message:
+                await self.verification_message.delete()
+            # Disable buttons
+            self.clear_buttons()
+            await self.duel_message.edit(view=self)
+
+            # Check if the interaction has already been responded to
+            if interaction.response.is_done():
+                # Use follow-up message if the interaction has already been responded to
+                await interaction.followup.send("Duel confirmed.", ephemeral=True)
+        else:
+            await interaction.response.send_message("One or both players are not registered in the ranking system.", ephemeral=True)
+
+        # Close the database connection
+        await conn.close()
+
+
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a duel between two players.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
@@ -524,162 +722,168 @@ async def submit_duel(interaction: discord.Interaction, initiator: discord.Membe
         verification_request = f"This result will automatically expire <t:{expiration_unix_timestamp}:R>.\n"
         verification_request += f"{user_to_verify.mention} please react to this message confirming or denying the match results."
         embed.description += f"\n\n{verification_request}"
-        await duel_message.edit(embed=embed)
+        #await duel_message.edit(embed=embed)
+
+# ENABLE BUTTON        # Create a ConfirmationView instance with necessary data
         verification_message = await interaction.followup.send(f"{user_to_verify.mention} please react to the above message confirming or denying the match results.")
-        await duel_message.add_reaction('✅')
-        await duel_message.add_reaction('❌')
+        view = ConfirmationView(initiator.id, opponent.id, duel_message, winner.id, loser.id, winner_score, loser_score, verification_message=verification_message)
+        await duel_message.edit(view=view)
+# ENABLEBUTTON        #await interaction.followup.send("Confirm or deny the match results", view=view)
+        #verification_message = await interaction.followup.send(f"{user_to_verify.mention} please react to the above message confirming or denying the match results.")
+        # await duel_message.add_reaction('✅')
+        # await duel_message.add_reaction('❌')
 
-        submitter_id = interaction.user.id
+        # submitter_id = interaction.user.id
 
-        def check(reaction, user):
-            if reaction.message.id != duel_message.id:
-                return False
-            non_submitter_id = initiator.id if submitter_id == opponent.id else opponent.id
-            if user.id == non_submitter_id:
-                return str(reaction.emoji) in ['✅', '❌']  # Other player can confirm or deny
-            elif user.id == submitter_id:
-                return str(reaction.emoji) == '❌'  # Submitter can only deny
-            else:
-                return False  # Ignore other users
-        try:
-            reaction, user = await bot.wait_for('reaction_add', timeout=3600.0, check=check)
-            if str(reaction.emoji) == '✅':
-                winner_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", winner.id)
-                loser_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", loser.id)
+        # def check(reaction, user):
+        #     if reaction.message.id != duel_message.id:
+        #         return False
+        #     non_submitter_id = initiator.id if submitter_id == opponent.id else opponent.id
+        #     if user.id == non_submitter_id:
+        #         return str(reaction.emoji) in ['✅', '❌']  # Other player can confirm or deny
+        #     elif user.id == submitter_id:
+        #         return str(reaction.emoji) == '❌'  # Submitter can only deny
+        #     else:
+        #         return False  # Ignore other users
+        # try:
+        #     reaction, user = await bot.wait_for('reaction_add', timeout=3600.0, check=check)
+        #     if str(reaction.emoji) == '✅':
+        #         winner_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", winner.id)
+        #         loser_data = await conn.fetchrow("SELECT playfabid, elo_duelsx FROM ranked_players WHERE discordid = $1", loser.id)
 
-                if winner_data and loser_data:
-                    winner_playfabid, winner_rating = winner_data
-                    loser_playfabid, loser_rating = loser_data
-                    new_winner_elo_exact = calculate_elo(winner_rating, 32, 1, 1, loser_rating)
-                    new_loser_elo_exact = calculate_elo(loser_rating, 32, 0, 1, winner_rating)
-                    winner_elo_change = round(new_winner_elo_exact - winner_rating)
-                    loser_elo_change = round(new_loser_elo_exact - loser_rating)
-                    winner_elo_change_formatted = f"+{winner_elo_change}" if winner_elo_change >= 0 else f"{winner_elo_change}"
-                    loser_elo_change_formatted = f"+{loser_elo_change}" if loser_elo_change >= 0 else f"{loser_elo_change}"
-                    submitting_playfabid = winner_playfabid if interaction.user.id == winner.id else loser_playfabid
+        #         if winner_data and loser_data:
+        #             winner_playfabid, winner_rating = winner_data
+        #             loser_playfabid, loser_rating = loser_data
+        #             new_winner_elo_exact = calculate_elo(winner_rating, 32, 1, 1, loser_rating)
+        #             new_loser_elo_exact = calculate_elo(loser_rating, 32, 0, 1, winner_rating)
+        #             winner_elo_change = round(new_winner_elo_exact - winner_rating)
+        #             loser_elo_change = round(new_loser_elo_exact - loser_rating)
+        #             winner_elo_change_formatted = f"+{winner_elo_change}" if winner_elo_change >= 0 else f"{winner_elo_change}"
+        #             loser_elo_change_formatted = f"+{loser_elo_change}" if loser_elo_change >= 0 else f"{loser_elo_change}"
+        #             submitting_playfabid = winner_playfabid if interaction.user.id == winner.id else loser_playfabid
 
-                    await log_duel(conn, submitting_playfabid, winner_playfabid, winner_score, new_winner_elo_exact, loser_playfabid, loser_score, new_loser_elo_exact)
+        #             await log_duel(conn, submitting_playfabid, winner_playfabid, winner_score, new_winner_elo_exact, loser_playfabid, loser_score, new_loser_elo_exact)
 
-                    # Update Kills and Deaths
-                    await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", winner_score, loser_score, winner.id)
-                    await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", loser_score, winner_score, loser.id)
+        #             # Update Kills and Deaths
+        #             await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", winner_score, loser_score, winner.id)
+        #             await conn.execute("UPDATE ranked_players SET kills = kills + $1, deaths = deaths + $2 WHERE discordid = $3", loser_score, winner_score, loser.id)
 
-                    # Update ELO score for winner, then loser, then increase their overall match count.
-                    await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_winner_elo_exact, winner.id)
-                    await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_loser_elo_exact, loser.id)
-                    await conn.execute("UPDATE ranked_players SET matches = matches + 1 WHERE discordid = ANY($1::bigint[])", [winner.id, loser.id])
-                    # static coin reward?
-                    coin_reward = 3
-                    await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE playfabid = ANY($2::text[])", coin_reward, [winner_playfabid, loser_playfabid])
+        #             # Update ELO score for winner, then loser, then increase their overall match count.
+        #             await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_winner_elo_exact, winner.id)
+        #             await conn.execute("UPDATE ranked_players SET elo_duelsx = $1 WHERE discordid = $2", new_loser_elo_exact, loser.id)
+        #             await conn.execute("UPDATE ranked_players SET matches = matches + 1 WHERE discordid = ANY($1::bigint[])", [winner.id, loser.id])
+        #             # static coin reward?
+        #             coin_reward = 3
+        #             await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE playfabid = ANY($2::text[])", coin_reward, [winner_playfabid, loser_playfabid])
 
-                    house_account_result = await conn.fetchrow("SELECT balance, payout_rate FROM house_account ORDER BY id DESC LIMIT 1")
-                    house_balance, payout_rate_percentage = house_account_result if house_account_result else (0, 0)
-                    payout_rate_percentage /= 100
+        #             house_account_result = await conn.fetchrow("SELECT balance, payout_rate FROM house_account ORDER BY id DESC LIMIT 1")
+        #             house_balance, payout_rate_percentage = house_account_result if house_account_result else (0, 0)
+        #             payout_rate_percentage /= 100
 
-                    payout_amount = 0
-                    new_house_balance = house_balance
-                    if house_balance > 0 and payout_rate_percentage > 0:
-                        payout_amount = round(house_balance * payout_rate_percentage)
-                        if house_balance >= payout_amount * 2:
-                            new_house_balance = house_balance - (payout_amount * 2)
-                            await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE discordid = ANY($2::bigint[])", payout_amount, [winner.id, loser.id])
-                            await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
+        #             payout_amount = 0
+        #             new_house_balance = house_balance
+        #             if house_balance > 0 and payout_rate_percentage > 0:
+        #                 payout_amount = round(house_balance * payout_rate_percentage)
+        #                 if house_balance >= payout_amount * 2:
+        #                     new_house_balance = house_balance - (payout_amount * 2)
+        #                     await conn.execute("UPDATE ranked_players SET coins = coins + $1 WHERE discordid = ANY($2::bigint[])", payout_amount, [winner.id, loser.id])
+        #                     await conn.execute("UPDATE house_account SET balance = $1", new_house_balance)
 
-                    total_reward = coin_reward + payout_amount
-                    command_text = f"cmd: `/submit_duel @{winner.display_name} {winner_score} @{loser.display_name} {loser_score}`"
-                    # ELO rounded values
-                    winner_elo_rounded = round(new_winner_elo_exact)
-                    loser_elo_rounded = round(new_loser_elo_exact)
-                    # Calculate the new tier assignments
-                    tier_assignments = await calculate_tiers(conn)
+        #             total_reward = coin_reward + payout_amount
+        #             command_text = f"cmd: `/submit_duel @{winner.display_name} {winner_score} @{loser.display_name} {loser_score}`"
+        #             # ELO rounded values
+        #             winner_elo_rounded = round(new_winner_elo_exact)
+        #             loser_elo_rounded = round(new_loser_elo_exact)
+        #             # Calculate the new tier assignments
+        #             tier_assignments = await calculate_tiers(conn)
 
-                    # Retrieve the tier emojis for the winner and loser
-                    winner_tier_emoji = tier_assignments.get(winner_playfabid, ':regional_indicator_d:')
-                    loser_tier_emoji = tier_assignments.get(loser_playfabid, ':regional_indicator_d:')
+        #             # Retrieve the tier emojis for the winner and loser
+        #             winner_tier_emoji = tier_assignments.get(winner_playfabid, ':regional_indicator_d:')
+        #             loser_tier_emoji = tier_assignments.get(loser_playfabid, ':regional_indicator_d:')
 
-                    # Fetch the updated ELO and purse values for the embed
-                    updated_winner_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", winner.id)
-                    updated_loser_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", loser.id)
+        #             # Fetch the updated ELO and purse values for the embed
+        #             updated_winner_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", winner.id)
+        #             updated_loser_data = await conn.fetchrow("SELECT elo_duelsx, coins FROM ranked_players WHERE discordid = $1", loser.id)
 
-                    updated_winner_elo, updated_winner_purse = updated_winner_data['elo_duelsx'], updated_winner_data['coins']
-                    updated_loser_elo, updated_loser_purse = updated_loser_data['elo_duelsx'], updated_loser_data['coins']
+        #             updated_winner_elo, updated_winner_purse = updated_winner_data['elo_duelsx'], updated_winner_data['coins']
+        #             updated_loser_elo, updated_loser_purse = updated_loser_data['elo_duelsx'], updated_loser_data['coins']
 
-                    # Construct the embed with the updated values
-                    updated_embed = discord.Embed(
-                        title=f"1v1 Duel Winner: {winner.display_name} vs {loser.display_name} ({winner_score}-{loser_score})",
-                        color=discord.Color.green()
-                    )
-                    updated_embed.add_field(
-                        name=f"{winner.display_name}: {round(updated_winner_elo)} ({winner_elo_change_formatted})",
-                        value=f"{winner_tier_emoji} Tier   :coin: {updated_winner_purse}", 
-                        inline=True
-                    )
-                    updated_embed.add_field(
-                        name=f"{loser.display_name}: {round(updated_loser_elo)} ({loser_elo_change_formatted})",
-                        value=f"{loser_tier_emoji} Tier   :coin: {updated_loser_purse}", 
-                        inline=True
-                    )
+        #             # Construct the embed with the updated values
+        #             updated_embed = discord.Embed(
+        #                 title=f"1v1 Duel Winner: {winner.display_name} vs {loser.display_name} ({winner_score}-{loser_score})",
+        #                 color=discord.Color.green()
+        #             )
+        #             updated_embed.add_field(
+        #                 name=f"{winner.display_name}: {round(updated_winner_elo)} ({winner_elo_change_formatted})",
+        #                 value=f"{winner_tier_emoji} Tier   :coin: {updated_winner_purse}", 
+        #                 inline=True
+        #             )
+        #             updated_embed.add_field(
+        #                 name=f"{loser.display_name}: {round(updated_loser_elo)} ({loser_elo_change_formatted})",
+        #                 value=f"{loser_tier_emoji} Tier   :coin: {updated_loser_purse}", 
+        #                 inline=True
+        #             )
 
-                    updated_embed.set_footer(text=f"Match result confirmed by {user.display_name}")
-                    updated_embed.timestamp = datetime.now()
-                    # Construct the description with Participation Reward and Purse as line items
-                    description_lines = [
-                        f"`/submit_duel @{initiator.display_name} {initiator_score} @{opponent.display_name} {opponent_score}`",
-                        f"Payout: **{total_reward}** [ {coin_reward} + ({payout_amount} house tip) ]",
-                        f"Purse: 0" 
-                    ]
-                    updated_embed.description = "\n".join(description_lines)
+        #             updated_embed.set_footer(text=f"Match result confirmed by {user.display_name}")
+        #             updated_embed.timestamp = datetime.now()
+        #             # Construct the description with Participation Reward and Purse as line items
+        #             description_lines = [
+        #                 f"`/submit_duel @{initiator.display_name} {initiator_score} @{opponent.display_name} {opponent_score}`",
+        #                 f"Payout: **{total_reward}** [ {coin_reward} + ({payout_amount} house tip) ]",
+        #                 f"Purse: 0" 
+        #             ]
+        #             updated_embed.description = "\n".join(description_lines)
 
-                    # Set the URL for the leaderboard
-                    updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
+        #             # Set the URL for the leaderboard
+        #             updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
 
-                    # Check if the duel was initiated in the test channel
-                    if interaction.channel.name == 'chivstats-test':
-                        # If it is, update the test channel message or send a new message if it doesn't exist
-                        await duel_message.edit(embed=updated_embed)
-                    else:
-                        # Fetch the original message by ID before editing
-                        duel_message = await interaction.channel.fetch_message(duel_message_id)
-                        await duel_message.edit(embed=updated_embed)  # Update the original message
+        #             # Check if the duel was initiated in the test channel
+        #             if interaction.channel.name == 'chivstats-test':
+        #                 # If it is, update the test channel message or send a new message if it doesn't exist
+        #                 await duel_message.edit(embed=updated_embed)
+        #             else:
+        #                 # Fetch the original message by ID before editing
+        #                 duel_message = await interaction.channel.fetch_message(duel_message_id)
+        #                 await duel_message.edit(embed=updated_embed)  # Update the original message
 
-                        # Echo the updated result to other channels named 'chivstats-ranked'
-                        for guild in bot.guilds:
-                            channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
-                            if channel and channel.id != interaction.channel.id:  # Ensure we don't send it to the original channel
-                                try:
-                                    # Use the updated embed with confirmed results
-                                    embed_copy = updated_embed.copy()  
-                                    # Remove user mentions to avoid highlighting users in other guilds
-                                    embed_copy.description = embed_copy.description.replace(f"@{initiator.display_name}", initiator.display_name).replace(f"@{opponent.display_name}", opponent.display_name)
-                                    await asyncio.sleep(0.5)  # Add a 500ms delay to avoid rate limiting
-                                    await channel.send(embed=embed_copy)
-                                    guild_names_sent_to.append(guild.name)  # Add the name of the guild to the list
-                                except Exception as e:
-                                    print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
+        #                 # Echo the updated result to other channels named 'chivstats-ranked'
+        #                 for guild in bot.guilds:
+        #                     channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
+        #                     if channel and channel.id != interaction.channel.id:  # Ensure we don't send it to the original channel
+        #                         try:
+        #                             # Use the updated embed with confirmed results
+        #                             embed_copy = updated_embed.copy()  
+        #                             # Remove user mentions to avoid highlighting users in other guilds
+        #                             embed_copy.description = embed_copy.description.replace(f"@{initiator.display_name}", initiator.display_name).replace(f"@{opponent.display_name}", opponent.display_name)
+        #                             await asyncio.sleep(0.5)  # Add a 500ms delay to avoid rate limiting
+        #                             await channel.send(embed=embed_copy)
+        #                             guild_names_sent_to.append(guild.name)  # Add the name of the guild to the list
+        #                         except Exception as e:
+        #                             print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
 
-                        if audit_channel:
-                            if guild_names_sent_to:
-                                audit_message = f"Duel echoed to the following guilds: {', '.join(guild_names_sent_to)}"
-                            else:
-                                audit_message = "Duel was not echoed to any other guilds."
-                            await audit_channel.send(audit_message)
-                    await verification_message.delete()
-                else:
-                    await interaction.followup.send("One or both players are not registered in the ranking system.", ephemeral=True)
+        #                 if audit_channel:
+        #                     if guild_names_sent_to:
+        #                         audit_message = f"Duel echoed to the following guilds: {', '.join(guild_names_sent_to)}"
+        #                     else:
+        #                         audit_message = "Duel was not echoed to any other guilds."
+        #                     await audit_channel.send(audit_message)
+        #             await verification_message.delete()
+        #         else:
+        #             await interaction.followup.send("One or both players are not registered in the ranking system.", ephemeral=True)
 
-            elif str(reaction.emoji) == '❌':
-                cancel_message = f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel denied by {user_to_verify.mention}." if user.id == user_to_verify.id else f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel cancelled by {initiator.mention}."
-                await duel_message.edit(content=cancel_message, embed=None)
-                await verification_message.delete()
+        #     elif str(reaction.emoji) == '❌':
+        #         cancel_message = f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel denied by {user_to_verify.mention}." if user.id == user_to_verify.id else f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel cancelled by {initiator.mention}."
+        #         await duel_message.edit(content=cancel_message, embed=None)
+        #         await verification_message.delete()
 
-        except asyncio.TimeoutError:
-            timeout_message = f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel confirmation timed out."
-            await duel_message.edit(content=timeout_message, embed=None)
+        # except asyncio.TimeoutError:
+        #     timeout_message = f"[ @{initiator.display_name} vs @{opponent.display_name} ] Duel confirmation timed out."
+        #     await duel_message.edit(content=timeout_message, embed=None)
 
-        try:
-            await duel_message.clear_reactions()
-        except discord.errors.Forbidden:
-            pass
+        # try:
+        #     await duel_message.clear_reactions()
+        # except discord.errors.Forbidden:
+        #     pass
 
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
