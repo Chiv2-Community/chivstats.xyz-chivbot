@@ -54,10 +54,6 @@ def setup(bot):
 # Indicate bot startup in console
 print("Bot is starting up...")
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user.name}')
-
 # Global variables and constants
 duel_queue = []
 duo_queue = []
@@ -103,6 +99,73 @@ async def on_application_command_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(embed=embed, ephemeral=True)
     else:
         print(f"An unexpected error occurred: {error}")
+
+
+@bot.event
+async def on_ready():
+    print("Bot has started up.")
+
+    # Load outstanding confirmation requests from the database
+    conn = await create_db_connection()
+    try:
+        pending_confirmations = await conn.fetch("SELECT * FROM duel_confirmations WHERE status = 'pending'")
+        print(f"Found {len(pending_confirmations)} pending confirmations.")
+
+        for confirmation in pending_confirmations:
+            channel_id = confirmation['channel_id']
+            message_id = confirmation['message_id']
+            submitter_id = confirmation['submitter_id']
+            opponent_id = confirmation['opponent_id']
+            winner_id = confirmation['winner_id']
+            loser_id = confirmation['loser_id']
+            winner_score = confirmation['winner_score']
+            loser_score = confirmation['loser_score']
+
+            channel = bot.get_channel(channel_id)
+            if channel:
+                try:
+                    message = await channel.fetch_message(message_id)
+                    print(f"Message found: {message_id}. Re-adding confirmation buttons...")
+
+                    # Create the ConfirmationView instance with necessary data
+                    view = ConfirmationView(
+                        submitter_id=submitter_id,
+                        non_submitter_id=opponent_id,
+                        duel_message=message,
+                        winner_id=winner_id,
+                        loser_id=loser_id,
+                        winner_score=winner_score,
+                        loser_score=loser_score
+                    )
+                    view.re_add_buttons()  # Call method to re-add buttons to the view
+
+                    # Update the message with the new view
+                    await message.edit(view=view)
+                    print(f"Confirmation buttons re-added for message {message_id}.")
+                except discord.NotFound:
+                    print(f"Message with ID {message_id} not found in channel {channel_id}. It may have been deleted.")
+                except discord.Forbidden:
+                    print(f"Bot does not have permissions to edit message with ID {message_id} in channel {channel_id}.")
+                except Exception as e:
+                    print(f"Failed to restore view for confirmation: {e}")
+            else:
+                print(f"Channel not found or bot does not have access to the channel ID: {channel_id}")
+
+        print("Completed processing pending confirmations.")
+
+    except Exception as e:
+        print(f"Error loading and processing pending confirmations: {e}")
+    finally:
+        await close_db_connection(conn)
+
+
+# Global error handler for interactions
+@bot.event
+async def on_interaction_error(interaction, error):
+    print(f"Interaction failed: {error}")
+    await interaction.response.send_message("There was an error with this interaction. Please contact an administrator.", ephemeral=True)
+
+# Ensure the bot has the necessary permissions to edit messages and manage messages in the channels it operates in.
 
 async def send_audit_message(interaction):
     target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
@@ -310,9 +373,6 @@ async def get_common_name_from_ranked_players(conn, playfabid):
     else:  # If no common name found in ranked_players, look in the players table
         return await get_most_common_alias(conn, playfabid)
 
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user.name}')
 
 async def echo_to_guilds(interaction, embed, echo_channel_name):
     origin_guild_name = interaction.guild.name
@@ -365,27 +425,71 @@ async def odds(interaction: discord.Interaction, player1: discord.Member, player
 
     conn = await create_db_connection()
     try:
-        elo_player1 = await conn.fetchval("SELECT elo_duelsx FROM ranked_players WHERE discordid = $1", player1.id)
-        elo_player2 = await conn.fetchval("SELECT elo_duelsx FROM ranked_players WHERE discordid = $1", player2.id)
+        # Fetch necessary data
+        elo_player1, playfabid_player1 = await get_player_data(conn, player1.id)
+        elo_player2, playfabid_player2 = await get_player_data(conn, player2.id)
 
+        total_matches_player1 = await conn.fetchval("SELECT COUNT(*) FROM duels WHERE winner_playfabid = $1 OR loser_playfabid = $1", playfabid_player1)
+        total_matches_player2 = await conn.fetchval("SELECT COUNT(*) FROM duels WHERE winner_playfabid = $1 OR loser_playfabid = $1", playfabid_player2)
+
+        head_to_head_stats, total_kills_deaths = await fetch_head_to_head_detailed(conn, playfabid_player1, playfabid_player2)
+
+        # Calculate odds
         odds_player1, odds_player2, chance_p1, chance_p2 = calculate_odds(elo_player1, elo_player2)
 
-        embed = discord.Embed(
-            title="Duel Odds",
-            description=(
-                f"The odds of {player1.display_name} beating {player2.display_name} are {odds_player1}:1 "
-                f"({chance_p1}% chance to win).\n"
-                f"The odds of {player2.display_name} beating {player1.display_name} are {odds_player2}:1 "
-                f"({chance_p2}% chance to win)."
+        # Create the embed
+        embed = discord.Embed(title="Duel Odds Analysis", color=discord.Color.blue())
+        embed.add_field(
+            name="Matchup Odds of Winning",
+            value=f"{player1.display_name}: {odds_player1}:1 ({chance_p1}%)\n{player2.display_name}: {odds_player2}:1 ({chance_p2}%)",
+            inline=False
+        )
+
+        avg_winner, h2h_wins, h2h_losses, total_h2h_matches, win_rate, h2h_percent_p1, h2h_percent_p2 = calculate_head_to_head_stats(
+            head_to_head_stats, playfabid_player1, playfabid_player2, total_matches_player1, total_matches_player2, player1.display_name, player2.display_name
+        )
+
+        # Add head-to-head statistics to the embed
+        embed.add_field(
+            name=f"Pair's Head-to-Head Record ({total_h2h_matches} Duels)",
+            value=f"Average Winner: {avg_winner} ({h2h_wins}:{h2h_losses} - {win_rate}%)",
+            inline=False
+        )
+        embed.add_field(
+            name=f"{player1.display_name}'s Kills to Deaths vs {player2.display_name}",
+            value=total_kills_deaths,
+            inline=False
+        )
+        embed.add_field(
+            name="Player's Percentage of Total Duels overall",
+            value=(
+                f"{player1.display_name} - {h2h_percent_p1}% ({total_h2h_matches} duels of {total_matches_player1})\n"
+                f"{player2.display_name} - {h2h_percent_p2}% ({total_h2h_matches} duels of {total_matches_player2})"
             ),
-            color=discord.Color.blue()
+            inline=False
         )
         await interaction.followup.send(embed=embed)
 
     except Exception as e:
-        await interaction.followup.send(f"An error occurred while calculating the odds: {e}", ephemeral=True)
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
     finally:
         await close_db_connection(conn)
+
+def calculate_confidence(head_to_head_stats, id_player1, id_player2):
+    wins_player1 = sum(1 for match in head_to_head_stats if match['winner_playfabid'] == id_player1)
+    losses_player1 = sum(1 for match in head_to_head_stats if match['loser_playfabid'] == id_player1)
+    wins_player2 = sum(1 for match in head_to_head_stats if match['winner_playfabid'] == id_player2)
+    losses_player2 = sum(1 for match in head_to_head_stats if match['loser_playfabid'] == id_player2)
+
+    total_matches = len(head_to_head_stats)
+
+    if total_matches > 0:
+        confidence_p1 = round((wins_player1 / total_matches) * 100, 2)
+        confidence_p2 = round((wins_player2 / total_matches) * 100, 2)
+    else:
+        confidence_p1 = confidence_p2 = 50  # Equal confidence if no matches played
+
+    return confidence_p1, confidence_p2, total_matches, wins_player1, losses_player1, wins_player2, losses_player2
 
 def calculate_odds(elo_player1, elo_player2):
     expected_score_p1 = 1 / (1 + 10 ** ((elo_player2 - elo_player1) / 400))
@@ -396,7 +500,46 @@ def calculate_odds(elo_player1, elo_player2):
     chance_p2 = round(expected_score_p2 * 100, 2)
     return odds_player1, odds_player2, chance_p1, chance_p2
 
+async def get_player_data(conn, discord_id):
+    elo = await conn.fetchval("SELECT elo_duelsx FROM ranked_players WHERE discordid = $1", discord_id)
+    playfabid = await conn.fetchval("SELECT playfabid FROM ranked_players WHERE discordid = $1", discord_id)
+    return elo, playfabid
 
+async def fetch_head_to_head(conn, playfabid1, playfabid2):
+    return await conn.fetch("""
+        SELECT winner_playfabid, loser_playfabid FROM duels
+        WHERE (winner_playfabid = $1 AND loser_playfabid = $2) OR (winner_playfabid = $2 AND loser_playfabid = $1)
+    """, playfabid1, playfabid2)
+
+async def fetch_head_to_head_detailed(conn, playfabid1, playfabid2):
+    # Fetch head-to-head matches and calculate total kills/deaths
+    head_to_head_matches = await conn.fetch("""
+        SELECT winner_playfabid, loser_playfabid, winner_score, loser_score FROM duels
+        WHERE (winner_playfabid = $1 AND loser_playfabid = $2) OR (winner_playfabid = $2 AND loser_playfabid = $1)
+    """, playfabid1, playfabid2)
+
+    total_kills = sum(match['winner_score'] for match in head_to_head_matches)
+    total_deaths = sum(match['loser_score'] for match in head_to_head_matches)
+
+    return head_to_head_matches, f"{total_kills} Kills, {total_deaths} Deaths"
+def calculate_head_to_head_stats(head_to_head_stats, id_player1, id_player2, total_p1, total_p2, name_player1, name_player2):
+    h2h_wins_p1 = sum(1 for match in head_to_head_stats if match['winner_playfabid'] == id_player1)
+    h2h_losses_p1 = sum(1 for match in head_to_head_stats if match['loser_playfabid'] == id_player1)
+    total_h2h_matches = len(head_to_head_stats)
+
+    win_rate = round((h2h_wins_p1 / total_h2h_matches) * 100, 2) if total_h2h_matches > 0 else 0
+
+    if h2h_wins_p1 > h2h_losses_p1:
+        avg_winner = name_player1
+    elif h2h_wins_p1 < h2h_losses_p1:
+        avg_winner = name_player2
+    else:
+        avg_winner = "Equal"
+
+    h2h_percent_p1 = round((total_h2h_matches / total_p1) * 100, 2) if total_p1 > 0 else 0
+    h2h_percent_p2 = round((total_h2h_matches / total_p2) * 100, 2) if total_p2 > 0 else 0
+
+    return avg_winner, h2h_wins_p1, h2h_losses_p1, total_h2h_matches, win_rate, h2h_percent_p1, h2h_percent_p2
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Display the top 10 leaderboard for duels or duos.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
@@ -554,7 +697,7 @@ async def calculate_tiers(conn):
     for tier, index_cutoff in tier_indices.items():
         while current_index < index_cutoff:
             if current_index < len(remaining_players):
-                playfabid, elo_score = remaining_players[current_index]
+                playfabid, elo_scores = remaining_players[current_index]
                 tier_assignments[playfabid] = emoji_mapping[tier]
                 current_index += 1
             else:
@@ -649,6 +792,15 @@ async def submit_duel(interaction: discord.Interaction, submitter_score: int, op
         embed.add_field(name="Score", value=f"{winner_score}-{loser_score}", inline=True)
 
         duel_message = await interaction.followup.send(embed=embed)
+        # Save the confirmation request details to the database
+        conn = await create_db_connection()
+        try:
+            await conn.execute("""
+                INSERT INTO duel_confirmations (message_id, channel_id, submitter_id, opponent_id, winner_id, loser_id, submitter_score, opponent_score, winner_score, loser_score, status) 
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+            """, duel_message.id, duel_message.channel.id, interaction.user.id, opponent.id, winner.id, loser.id, submitter_score, opponent_score, winner_score, loser_score)
+        finally:
+            await close_db_connection(conn)
 
         cst_timezone = pytz.timezone('America/Chicago')
         current_time_cst = datetime.now(pytz.utc).astimezone(cst_timezone)
@@ -686,26 +838,46 @@ class ConfirmationView(discord.ui.View):
         self.winner_score = winner_score
         self.loser_score = loser_score
         self.verification_message = verification_message
+        self.duel_message_id = duel_message.id
+        self.channel_id = duel_message.channel.id
 
-    def clear_buttons(self):
-        for child in list(self.children):  # Make a copy of the list as we are mutating it
-            if isinstance(child, discord.ui.Button):
-                self.remove_item(child)
 
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def confirm_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+        # The callbacks are set directly on the button instance
+        self.confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.green, custom_id=f"confirm_{duel_message.id}")
+        self.confirm_button.callback = self.confirm_button_clicked  # Set the callback
+
+        self.deny_button = discord.ui.Button(label="Deny", style=discord.ButtonStyle.red, custom_id=f"deny_{duel_message.id}")
+        self.deny_button.callback = self.deny_button_clicked  # Set the callback
+
+        # Add buttons to the view
+        self.add_item(self.confirm_button)
+        self.add_item(self.deny_button)
+
+    async def confirm_button_clicked(self, interaction: discord.Interaction):
+        # Logic when confirm button is clicked
         if interaction.user.id == self.non_submitter_id:
+            # Disable the buttons to prevent multiple clicks
+            self.confirm_button.disabled = True
+            self.deny_button.disabled = True
+            # Update the message with disabled buttons
+            await self.duel_message.edit(view=self)
+            # Now handle the confirmation
             await self.handle_confirm(interaction)
         else:
             await interaction.response.send_message("Only the challenged player can confirm this duel.", ephemeral=True)
 
-    @discord.ui.button(label="Deny", style=discord.ButtonStyle.red)
-    async def deny_button(self, button: discord.ui.Button, interaction: discord.Interaction):
+    async def deny_button_clicked(self, interaction: discord.Interaction):
+        # Logic when deny button is clicked
         if interaction.user.id in [self.submitter_id, self.non_submitter_id]:
+            # Disable the buttons to prevent multiple clicks
+            self.confirm_button.disabled = True
+            self.deny_button.disabled = True
+            # Update the message with disabled buttons
+            await self.duel_message.edit(view=self)
+            # Now handle the denial
             await self.handle_deny(interaction)
         else:
             await interaction.response.send_message("You are not authorized to deny this duel.", ephemeral=True)
-
     async def handle_deny(self, interaction: discord.Interaction):
         submitter_name = interaction.guild.get_member(self.submitter_id).display_name
         opponent_name = interaction.guild.get_member(self.non_submitter_id).display_name
@@ -723,9 +895,15 @@ class ConfirmationView(discord.ui.View):
             await self.verification_message.delete()
         await interaction.response.send_message("Duel cancelled.", ephemeral=True)
 
-
+    def clear_buttons(self):
+        # Clear all buttons from the view
+        self.children.clear()  # This will remove all UI elements from the view
+        # Update the message to show the view without buttons
+        return self.duel_message.edit(view=self)
+    
     async def handle_confirm(self, interaction: discord.Interaction):
         await interaction.response.defer()
+        await self.clear_buttons()
         conn = await create_db_connection()
 
         target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
@@ -740,7 +918,7 @@ class ConfirmationView(discord.ui.View):
         if winner_data and loser_data:
             winner_playfabid, winner_rating = winner_data
             loser_playfabid, loser_rating = loser_data
-            self.clear_buttons()
+            await self.clear_buttons()
             new_winner_elo_exact = calculate_elo(winner_rating, 32, 1, 1, loser_rating)
             new_loser_elo_exact = calculate_elo(loser_rating, 32, 0, 1, winner_rating)
 
@@ -801,7 +979,6 @@ class ConfirmationView(discord.ui.View):
 
             updated_embed.url = "https://chivstats.xyz/leaderboards/ranked_combat/"
 
-            self.clear_buttons()
             await self.duel_message.edit(embed=updated_embed)
 
             # Determine the channel to echo the message based on where the command was executed
@@ -819,7 +996,7 @@ class ConfirmationView(discord.ui.View):
             if self.verification_message:
                 await self.verification_message.delete()
 
-            self.clear_buttons()
+            await self.clear_buttons()
             await self.duel_message.edit(view=self)
             await update_leaderboard_message()
 
