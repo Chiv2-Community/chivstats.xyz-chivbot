@@ -12,9 +12,10 @@ import json
 from discord.ui import Button, View
 from discord.ext import commands
 
-from lts import lts_register_team, lts_roster, lts_rename_team, lts_leave_team, lts_teams, submit_lts
-from coin import coin_announce_command, coin_clown_command, update_house_account_balance
+from lts import LTSCog
+from coin import CoinCog
 from admin import AdminCommands
+from privateservers import PrivateServers
 
 
 # Database connection credentials
@@ -32,6 +33,9 @@ GUILD_IDS = [1111684756896239677, #unchained @gimmic
              1117929297471094824, #legacy @DADLER
              931513346937716746, #PAX snakecase
              966182758986678302, #Benches @tyra.morga
+             1152345485747691560, #WILD WEST @SMD408
+             1213625786163011714, #Duelyard server @short
+             987187886094962828, #The Crucible, @kait
                 ]
 
 target_guild_id = 1111684756896239677  # ID of the 'Chivalry Unchained' guild
@@ -48,8 +52,7 @@ intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-def setup(bot):
-    bot.add_cog(AdminCommands(bot))
+    
 
 # Indicate bot startup in console
 print("Bot is starting up...")
@@ -73,6 +76,14 @@ async def get_discord_name_from_id(guild, discord_id):
     if member:
         return member.display_name  # or member.name for the actual Discord username
     return "Unknown User"
+
+async def get_player_rank(conn, elo_rating):
+    # This query counts how many players have a higher ELO rating than the given rating
+    rank = await conn.fetchval("""
+        SELECT COUNT(*) + 1 FROM ranked_players
+        WHERE elo_duelsx > $1
+    """, elo_rating)
+    return rank
 
 # Decorator to restrict command usage to specific channels
 def is_channel_named(allowed_channel_names):
@@ -191,65 +202,6 @@ async def send_audit_message(interaction):
         audit_message = f"Command executed: {entered_command} by {user_display_name} (ID: {user_id})"
         await audit_channel.send(audit_message)
 
-#from admin import admin_leave_guild_command, admin_delete_command, admin_notice_command, admin_register_command
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Make the bot leave a specified server.")
-async def admin_leave_guild(interaction: discord.Interaction, guild_id: int):
-    await admin_leave_guild_command(bot, interaction, guild_id)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Delete a specific message by its ID.")
-async def admin_delete(interaction: discord.Interaction, message_id: int):
-    await admin_delete_command(bot, interaction, message_id)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Send an embedded update notice to all servers.")
-async def admin_notice(interaction: discord.Interaction, title: str, message: str):
-    await admin_notice_command(bot, interaction, title, message)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Administratively correct user registration.")
-async def admin_register(interaction: discord.Interaction, member: discord.Member, playfabid: str):
-    await admin_register_command(bot, interaction, member, playfabid)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Make a chivstats ranked network announcement.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def coin_announce(interaction: discord.Interaction, title: str, message_content: str):
-    db_details = (DATABASE, USER, HOST)  # Pack the database details into a tuple
-    await coin_announce_command(bot, interaction, title, message_content, db_details)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="COST: 50 Add or remove a clown emoji to a user's nickname globally.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def coin_clown(interaction: discord.Interaction, member: discord.Member):
-    await coin_clown_command(interaction, member, bot, update_house_account_balance, DATABASE, USER, HOST)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Create a new LTS team.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def lts_register_team_command(interaction: discord.Interaction, team_name: str):
-    await lts_register_team(interaction, team_name)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Manage your LTS team's roster.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def lts_roster_command(interaction: discord.Interaction, action: str, player: discord.Member = None):
-    await lts_roster(interaction, action, player)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Rename your LTS team.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def lts_rename_team_command(interaction: discord.Interaction, new_team_name: str):
-    await lts_rename_team(interaction, new_team_name)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Leave your current LTS team.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def lts_leave_team_command(interaction: discord.Interaction):
-    await lts_leave_team(interaction)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="List all registered LTS teams and their owners.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def lts_teams_command(interaction: discord.Interaction):
-    await lts_teams(interaction)
-
-@bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a 3v3+ LTS match between two teams.")
-@is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def submit_lts_command(interaction: discord.Interaction, team_score: int, opposing_player: discord.Member, opposing_team_score: int):
-    await submit_lts(interaction, team_score, opposing_player, opposing_team_score)
-
 @bot.slash_command(guild_ids=GUILD_IDS, description="Lists the discords the chivbot is in, highlighting those with a chivstats-ranked channel.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def chivstats_network(interaction: discord.Interaction):
@@ -336,9 +288,6 @@ async def get_display_name_from_ranked_players(playfabid):
     finally:
         await close_db_connection(conn)
 
-def format_playfab_id_with_url(playfabid):
-    return f"[{playfabid}](https://chivstats.xyz/leaderboards/player/{playfabid}/)"
-
 async def format_playfab_id_with_url(playfabid):
     conn = await create_db_connection()
     try:
@@ -374,14 +323,35 @@ async def get_common_name_from_ranked_players(conn, playfabid):
         return await get_most_common_alias(conn, playfabid)
 
 
+import re
+
+def remove_mentions(text):
+    # Regular expression pattern to match Discord user and role mentions
+    pattern = r'<@!?[0-9]+>|<@&[0-9]+>'
+    # Replace found mentions with an empty string
+    return re.sub(pattern, '', text)
+
 async def echo_to_guilds(interaction, embed, echo_channel_name):
     origin_guild_name = interaction.guild.name
     guild_names_sent_to = []
+
     for guild in bot.guilds:
         echo_channel = discord.utils.get(guild.text_channels, name=echo_channel_name)
         if echo_channel and echo_channel.id != interaction.channel.id:
             try:
                 embed_copy = embed.copy()
+
+                # Use the custom remove_mentions function
+                if embed_copy.title:
+                    embed_copy.title = remove_mentions(embed_copy.title)
+                if embed_copy.description:
+                    embed_copy.description = remove_mentions(embed_copy.description)
+
+                # Optionally, strip mentions from fields
+                for field in embed_copy.fields:
+                    field.name = remove_mentions(field.name)
+                    field.value = remove_mentions(field.value)
+
                 await echo_channel.send(embed=embed_copy)
                 guild_names_sent_to.append(guild.name)
             except Exception as e:
@@ -392,30 +362,6 @@ async def echo_to_guilds(interaction, embed, echo_channel_name):
     else:
         audit_message = f"Message from {origin_guild_name} was not echoed to any other guilds."
     return audit_message
-
-
-async def audit_interaction(interaction: discord.Interaction, action_description: str, message_id: str, deleted_message_content: str = None):
-    command_name = interaction.command.name if interaction.command else 'unknown_command'
-    entered_command = f"/{command_name} {message_id}"
-    target_guild_id = 1111684756896239677
-    audit_channel_id = 1196358290066640946
-
-    target_guild = bot.get_guild(target_guild_id)
-    audit_channel = target_guild.get_channel(audit_channel_id) if target_guild else None
-
-    if audit_channel:
-        embed_description = f"Deleted by: {interaction.user.mention}\nCommand: `{entered_command}`"
-        if deleted_message_content:
-            embed_description += f"\nDeleted Message Content: {deleted_message_content}"
-        else:
-            embed_description += "\nDeleted Message Content: [Content not available or empty]"
-        
-        embed = discord.Embed(
-            title="Message Deleted",
-            description=embed_description,
-            color=discord.Color.red()
-        )
-        await audit_channel.send(embed=embed)
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Calculate the odds of one player beating another.")
@@ -461,7 +407,7 @@ async def odds(interaction: discord.Interaction, player1: discord.Member, player
             inline=False
         )
         embed.add_field(
-            name="Player's Percentage of Total Duels overall",
+            name="Times the pair fought eachother vs others.",
             value=(
                 f"{player1.display_name} - {h2h_percent_p1}% ({total_h2h_matches} duels of {total_matches_player1})\n"
                 f"{player2.display_name} - {h2h_percent_p2}% ({total_h2h_matches} duels of {total_matches_player2})"
@@ -512,16 +458,37 @@ async def fetch_head_to_head(conn, playfabid1, playfabid2):
     """, playfabid1, playfabid2)
 
 async def fetch_head_to_head_detailed(conn, playfabid1, playfabid2):
-    # Fetch head-to-head matches and calculate total kills/deaths
+    # Fetch head-to-head matches
     head_to_head_matches = await conn.fetch("""
         SELECT winner_playfabid, loser_playfabid, winner_score, loser_score FROM duels
         WHERE (winner_playfabid = $1 AND loser_playfabid = $2) OR (winner_playfabid = $2 AND loser_playfabid = $1)
     """, playfabid1, playfabid2)
 
-    total_kills = sum(match['winner_score'] for match in head_to_head_matches)
-    total_deaths = sum(match['loser_score'] for match in head_to_head_matches)
+    # Count wins for each player
+    wins_for_playfabid1 = sum(1 for match in head_to_head_matches if match['winner_playfabid'] == playfabid1)
+    wins_for_playfabid2 = len(head_to_head_matches) - wins_for_playfabid1
+
+    # Determine which player to focus on based on who has more overall wins
+    focused_playfabid = playfabid1 if wins_for_playfabid1 > wins_for_playfabid2 else playfabid2
+
+    # Initialize counters for the focused player's kills and deaths
+    total_kills = 0
+    total_deaths = 0
+
+    # Iterate over matches to calculate kills and deaths for the focused player
+    for match in head_to_head_matches:
+        if match['winner_playfabid'] == focused_playfabid:
+            # Add winner's kills and loser's score (as deaths for winner in that match)
+            total_kills += match['winner_score']
+            total_deaths += match['loser_score']
+        else:
+            # When the focused player loses, their kills are reflected in the loser's score
+            total_kills += match['loser_score']
+            # Add winner's score as deaths for the focused player
+            total_deaths += match['winner_score']
 
     return head_to_head_matches, f"{total_kills} Kills, {total_deaths} Deaths"
+
 def calculate_head_to_head_stats(head_to_head_stats, id_player1, id_player2, total_p1, total_p2, name_player1, name_player2):
     h2h_wins_p1 = sum(1 for match in head_to_head_stats if match['winner_playfabid'] == id_player1)
     h2h_losses_p1 = sum(1 for match in head_to_head_stats if match['loser_playfabid'] == id_player1)
@@ -765,8 +732,6 @@ async def submit_duel(interaction: discord.Interaction, submitter_score: int, op
 
         submitter_playfabid = await get_playfabid_of_discord_id(conn, interaction.user.id)
         opponent_playfabid = await get_playfabid_of_discord_id(conn, opponent.id)
-        submitter_name = await get_display_name_from_ranked_players(submitter_playfabid)
-        opponent_name = await get_display_name_from_ranked_players(opponent_playfabid)
 
         # Determining the winner and loser based on scores
         winner, loser = (interaction.user, opponent) if submitter_score > opponent_score else (opponent, interaction.user)
@@ -990,6 +955,19 @@ class ConfirmationView(discord.ui.View):
             # Send audit message to the audit channel
             if audit_channel:
                 await audit_channel.send(audit_message)
+
+            winner_rank = await get_player_rank(conn, updated_winner_elo)
+            loser_rank = await get_player_rank(conn, updated_loser_elo)
+
+            # Modify the confirmation message to include ranks instead of tier emojis
+            confirmation_message = (
+                f"**Duel**: [{self.winner_score}-{self.loser_score}] **{interaction.guild.get_member(self.winner_id).display_name}** _({round(updated_winner_elo)})_ "
+                f"vs. **{interaction.guild.get_member(self.loser_id).display_name}** _({round(updated_loser_elo)})_ [elo:{winner_elo_change}, coin:{total_reward}]."
+            )
+            for guild in bot.guilds:
+                ranked_audit_channel = discord.utils.get(guild.text_channels, name='ranked-audit')
+                if ranked_audit_channel:
+                    await ranked_audit_channel.send(confirmation_message)
 
             await self.duel_message.edit(embed=updated_embed)
 
@@ -1235,17 +1213,106 @@ async def check_or_create_duo_team(conn, playfabid1, playfabid2):
 
 
 
+class ConfirmationViewDuo(discord.ui.View):
+    def __init__(self, submitter, opponents, team1_score, team2_score, team1_id, team2_id, team1_elo, team2_elo, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.submitter = submitter
+        self.opponents = opponents
+        self.team1_score = team1_score
+        self.team2_score = team2_score
+        self.team1_id = team1_id
+        self.team2_id = team2_id
+        self.team1_elo = team1_elo
+        self.team2_elo = team2_elo
+        self.conn = None
 
+        self.confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.green)
+        self.confirm_button.callback = self.confirm_button_clicked
+
+        self.deny_button = discord.ui.Button(label="Deny", style=discord.ButtonStyle.red)
+        self.deny_button.callback = self.deny_button_clicked
+
+        self.add_item(self.confirm_button)
+        self.add_item(self.deny_button)
+
+    async def initialize_connection(self):
+        self.conn = await create_db_connection()
+
+    async def confirm_button_clicked(self, interaction: discord.Interaction):
+        # Check if the interaction user is one of the opponents
+        if interaction.user.id not in [self.opponents[0].id, self.opponents[1].id]:
+            await interaction.response.send_message("You are not authorized to confirm this match.", ephemeral=True)
+            return
+
+        # Calculate new ELO ratings
+        team1_new_elo, team2_new_elo = await calculate_duo_elo(self.team1_elo, self.team2_elo, self.team1_score, self.team2_score)
+
+        # Update the duo_teams table with new ELO ratings, increment match counter
+        await self.conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team1_new_elo, self.team1_id)
+        await self.conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team2_new_elo, self.team2_id)
+        await self.conn.execute("UPDATE duo_teams SET matches_played = matches_played + 1 WHERE id = ANY($1::bigint[])", [self.team1_id, self.team2_id])
+
+        # Fetch team names
+        team1_name = await self.conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", self.team1_id)
+        team2_name = await self.conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", self.team2_id)
+
+        # Calculate ELO changes
+        team1_elo_change = int(team1_new_elo - self.team1_elo)
+        team2_elo_change = int(team2_new_elo - self.team2_elo)
+
+                # Round ELO ratings to whole numbers
+        team1_new_elo_rounded = round(team1_new_elo)
+        team2_new_elo_rounded = round(team2_new_elo)
+        team1_elo_change_rounded = round(team1_new_elo - self.team1_elo)
+        team2_elo_change_rounded = round(team2_new_elo - self.team2_elo)
+
+        submitter_playfabid = await get_playfabid_of_discord_id(self.conn, interaction.user.id)
+        # Insert the match data into the "duos" table
+        await self.conn.execute("INSERT INTO duos (submitting_playfabid, winner_team_id, winner_score, winner_elo, loser_team_id, loser_score, loser_elo) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                        submitter_playfabid, self.team1_id, self.team1_score, team1_new_elo, self.team2_id, self.team2_score, team2_new_elo)
+
+        # Update the embed to show the match confirmation
+        embed = interaction.message.embeds[0]
+        embed.title = "2v2 Duos Match Result Confirmed"
+        embed.clear_fields()  # Clear previous fields if any
+        embed.add_field(name=f"Team {team1_name}", value=f"New ELO: {team1_new_elo_rounded} (Change: {team1_elo_change_rounded:+d})", inline=True)
+        embed.add_field(name=f"Team {team2_name}", value=f"New ELO: {team2_new_elo_rounded} (Change: {team2_elo_change_rounded:+d})", inline=True)
+        embed.color = discord.Color.green()
+        embed.set_footer(text=f"Match result confirmed by {interaction.user.display_name}.")
+        await interaction.message.edit(embed=embed, view=None)
+        # Call echo_to_guilds to echo the embed to other guilds
+        origin_channel_name = interaction.channel.name
+        await echo_to_guilds(interaction, embed, origin_channel_name)
+
+    async def deny_button_clicked(self, interaction: discord.Interaction):
+        # Check if the interaction user is one of the opponents or the submitter
+        if interaction.user.id not in [self.opponents[0].id, self.opponents[1].id, self.submitter.id]:
+            await interaction.response.send_message("You are not authorized to deny this match.", ephemeral=True)
+            return
+
+        # Update the embed to show the match denial
+        embed = interaction.message.embeds[0]
+        embed.title = "2v2 Duos Match Result Denied"
+        embed.color = discord.Color.red()
+        embed.set_footer(text=f"Match result denied by {interaction.user.display_name}.")
+        await interaction.message.edit(embed=embed, view=None)
+
+        # Optionally, you can add logic here if there's anything specific you want to do when a match is denied
+        # For example, logging the event, notifying specific channels, etc.
+
+        # Send a response back to the user who clicked the button
+        await interaction.response.send_message("The match submission has been denied.", ephemeral=True)
 
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Submit the result of a 2v2 duel between two teams.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
-async def submit_duo(interaction: discord.Interaction, team_member: discord.Member, team_score: int, 
-                      enemy1: discord.Member, enemy2: discord.Member, enemy_score: int):
-    try: 
-        conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
+async def submit_duo(interaction: discord.Interaction, team_member: discord.Member, team_score: int, enemy1: discord.Member, enemy2: discord.Member, enemy_score: int):
+    await interaction.response.defer()
 
+    conn = await create_db_connection()
+    try:
         # Fetch PlayFab IDs for all members of both teams
+        print("Fetching PlayFab IDs")
         team1_playfabid1 = await get_playfabid_of_discord_id(conn, interaction.user.id)
         team1_playfabid2 = await get_playfabid_of_discord_id(conn, team_member.id)
         team2_playfabid1 = await get_playfabid_of_discord_id(conn, enemy1.id)
@@ -1253,12 +1320,14 @@ async def submit_duo(interaction: discord.Interaction, team_member: discord.Memb
         command_text = f"/submit_duo @{interaction.user.display_name} & @{team_member.display_name} {team_score} vs @{enemy1.display_name} & @{enemy2.display_name} {enemy_score}"
 
         # Check for duplicate players
+        print("Checking for duplicate players")
         players = [interaction.user, team_member, enemy1, enemy2]
         if len(players) != len(set(player.id for player in players)):
             await interaction.response.send_message("Duplicate players detected! Please ensure all players are unique.", ephemeral=True)
             return
 
         # Verify none of the players are retired
+        print("Verifying retired players")
         player_ids = [interaction.user.id, team_member.id, enemy1.id, enemy2.id]
         results = await conn.fetch("SELECT discordid, retired FROM ranked_players WHERE discordid = ANY($1)", player_ids)
         retired_players = [discord_id for discord_id, retired in results if retired]
@@ -1268,10 +1337,10 @@ async def submit_duo(interaction: discord.Interaction, team_member: discord.Memb
             message += "\nPlease reactivate your account using /reactivate."
             await interaction.response.send_message(message, ephemeral=True)
             return
-
+        print("ephemeral message to submitter")
         # Send an ephemeral response to the submitter to indicate the submission was accepted
-        await interaction.response.send_message("Submission accepted. Please wait for confirmation from the opposing team.", ephemeral=True)
-
+        await interaction.followup.send("Submission accepted. Please wait for confirmation from the opposing team.", ephemeral=True)
+        print("Preparing embed message")
         # Check for existing teams or create new ones
         team1_id = await check_or_create_duo_team(conn, team1_playfabid1, team1_playfabid2)
         team2_id = await check_or_create_duo_team(conn, team2_playfabid1, team2_playfabid2)
@@ -1286,115 +1355,24 @@ async def submit_duo(interaction: discord.Interaction, team_member: discord.Memb
                         f"Team 2: <@{enemy1.id}> and <@{enemy2.id}> - Score: {enemy_score}",
             color=discord.Color.orange()
         )
-
-        # Send the initial response message or edit if it already exists
-        sent_message = await interaction.channel.send(embed=embed)
-
-        # Add reactions to the sent message
-        await sent_message.add_reaction('✅')
-        await sent_message.add_reaction('❌')
-
-        def check(reaction, user):
-            if reaction.message.id != sent_message.id:
-                return False
-            # Check if the user is part of the opposing team
-            is_opposing_team = user.id in [enemy1.id, enemy2.id]
-            # Check if the user is part of the submitting team
-            is_submitting_team = user.id in [interaction.user.id, team_member.id]
-            # Allow '✅' and '❌' for opposing team members
-            if is_opposing_team and str(reaction.emoji) in ['✅', '❌']:
-                return True
-            # Allow only '❌' for submitting team members
-            elif is_submitting_team and str(reaction.emoji) == '❌':
-                return True
-            # Ignore other reactions and users not part of the teams
-            return False
-
-        try:
-            # Wait for a valid reaction from the opposing team
-            reaction, user = await bot.wait_for('reaction_add', timeout=3600.0, check=check)
-            if str(reaction.emoji) == '✅':
-
-                # Calculate new ELO ratings
-                team1_new_elo, team2_new_elo = await calculate_duo_elo(team1_elo, team2_elo, team_score, enemy_score)
-
-                # Update the duo_teams table with new ELO ratings, increment match counter.
-                await conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team1_new_elo, team1_id)
-                await conn.execute("UPDATE duo_teams SET elo_rating = $1 WHERE id = $2", team2_new_elo, team2_id)
-                await conn.execute("UPDATE duo_teams SET matches_played = matches_played + 1 WHERE id = ANY($1::bigint[])", [team1_id, team2_id])
-                # Fetch team names
-                team1_name = await conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", team1_id)
-                team2_name = await conn.fetchval("SELECT team_name FROM duo_teams WHERE id = $1", team2_id)
-
-                # Calculate ELO changes
-                team1_elo_change = int(team1_new_elo - team1_elo)
-                team2_elo_change = int(team2_new_elo - team2_elo)
-                team1_new_elo_rounded = round(team1_new_elo)
-                team2_new_elo_rounded = round(team2_new_elo)
-
-                # Format ELO changes for display
-                team1_elo_change_str = f"({team1_elo_change:+})" if team1_elo_change != 0 else "(±0)"
-                team2_elo_change_str = f"({team2_elo_change:+})" if team2_elo_change != 0 else "(±0)"
-
-                # Insert the match data into the "duos" table
-                await conn.execute("INSERT INTO duos (submitting_playfabid, winner_team_id, winner_score, winner_elo, loser_team_id, loser_score, loser_elo) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-                                team1_playfabid1, team1_id, team_score, team1_new_elo, team2_id, enemy_score, team2_new_elo)
-
-                # Determine the winning team and set labels accordingly
-                if team_score > enemy_score:
-                    submitting_team_label = "Winners"
-                    opposing_team_label = "Losers"
-                    embed.title = f"2v2 Duos Match Winners: {team1_name}"
-                else:
-                    submitting_team_label = "Losers"
-                    opposing_team_label = "Winners"
-                    embed.title = f"2v2 Duos Match Winners: {team2_name}"
-
-                embed.color = discord.Color.green()
-                embed.set_footer(text=f"Match result confirmed by {user.display_name}.")                
-                embed.add_field(name=f"{submitting_team_label} - {team1_name} ELO: {team1_new_elo_rounded} {team1_elo_change_str}", value=f"{interaction.user.display_name} (submitter) and {team_member.display_name}", inline=False)
-                embed.add_field(name=f"{opposing_team_label} - {team2_name} ELO: {team2_new_elo_rounded} {team2_elo_change_str}", value=f"{enemy1.display_name} and {enemy2.display_name}", inline=False)
-                await sent_message.edit(embed=embed)
-                original_channel = interaction.channel
-                # Iterate through each guild the bot is a part of
-                channels_sent = 0
-                for guild in bot.guilds:
-                    # Find the #chivstats-ranked channel
-                    channel = discord.utils.get(guild.text_channels, name="chivstats-ranked")
-                    if channel and channel != original_channel:
-                        try:
-                            embed_copy = embed.copy()
-                            embed_copy.description=f"`{command_text}`\nView related details on the [chivstats.xyz Ranked Leaderboards]({DUELS_LEADERBOARD_URL}).\n Team 1: {interaction.user.display_name} and {team_member.display_name} - Score: {team_score}\n Team 2: {enemy1.display_name} and {enemy2.display_name} - Score: {enemy_score}"
-                            await asyncio.sleep(0.5)  # Add a 500ms delay
-                            await channel.send(embed=embed_copy)
-                            channels_sent += 1
-                        except Exception as e:
-                            print(f"Failed to send message to {channel.name} in {guild.name}: {e}")
-
-            elif str(reaction.emoji) == '❌':
-                # Process the duel result as denied
-                await sent_message.edit(content=f"Duel result denied by {user.display_name}.", embed=None)
-
-        except asyncio.TimeoutError:
-            await sent_message.edit(content="Duel confirmation timed out.", embed=None)
-        finally:
-            # Clear reactions after processing
-            try:
-                await sent_message.clear_reactions()
-            except discord.errors.Forbidden:
-                pass
+        # After sending the initial response message with the view attached
+        print("Creating ConfirmationViewDuo instance")
+        # Create the view and associate it with the embed
+        view = ConfirmationViewDuo(
+            interaction.user, [enemy1, enemy2], team_score, enemy_score,
+            team1_id, team2_id, team1_elo, team2_elo
+        )
+        print("Sending follow-up message with embed and view")
+        await view.initialize_connection()
+        
+        # Send the follow-up message with the embed and view
+        await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
-        # Handle exceptions and possibly roll back
         print(f"Error in submit_duo: {e}")
-        await conn.execute('ROLLBACK')
+        await interaction.followup.send("An error occurred while processing the duo match submission.", ephemeral=True)
     finally:
-        # Ensure the connection is closed
-        await conn.close()
-
-
-
-
+        await close_db_connection(conn)
 
 @bot.slash_command(guild_ids=GUILD_IDS, description="Create and or update your duos team name.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
@@ -1434,40 +1412,47 @@ async def duo_setup_team(interaction: discord.Interaction, team_member: discord.
 
 
 
-@bot.slash_command(guild_ids=GUILD_IDS, description="List all duo teams, their players, and ELO ranks in descending order.")
+@bot.slash_command(guild_ids=GUILD_IDS, description="List top 25 duo teams that have participated in matches, ranked by ELO.")
 @is_channel_named(['chivstats-ranked', 'chivstats-test'])
 async def duo_teams(interaction: discord.Interaction):
     conn = await asyncpg.connect(database=DATABASE, user=USER, host=HOST)
 
     try:
-        # Query all active duo teams with their ELO rating, ordered by ELO in descending order
+        # Query top 25 active duo teams with match participation, ordered by ELO in descending order
         teams = await conn.fetch("""
-            SELECT team_name, player1_id, player2_id, elo_rating, ROW_NUMBER() OVER (ORDER BY elo_rating DESC)
-            FROM duo_teams
-            WHERE retired = false
+            SELECT dt.team_name, dt.player1_id, dt.player2_id, dt.elo_rating, COUNT(d.team_id) AS match_count
+            FROM duo_teams dt
+            LEFT JOIN (
+                SELECT winner_team_id AS team_id FROM duos
+                UNION ALL
+                SELECT loser_team_id AS team_id FROM duos
+            ) AS d ON dt.id = d.team_id
+            WHERE dt.retired = false
+            GROUP BY dt.id
+            HAVING COUNT(d.team_id) > 0
+            ORDER BY dt.elo_rating DESC
+            LIMIT 25;
         """)
 
         if not teams:
-            await interaction.response.send_message("There are currently no duo teams registered.", ephemeral=True)
+            await interaction.response.send_message("There are currently no active duo teams with match participation.", ephemeral=True)
             return
 
         # Create an embed to list the duo teams
         embed = discord.Embed(
-            title="Duo Teams Ranked by ELO",
-            description="Here are the currently registered duo teams, sorted by their ELO in descending order:",
+            title="Top 25 Active Duo Teams with Match Participation",
+            description="Here are the top 25 active duo teams that have participated in matches, sorted by their ELO in descending order:",
             color=discord.Color.blue()
         )
         
         # Loop through the teams and add each to the embed
-        for team_info in teams:
-            team_name, player1_id, player2_id, elo_rating, position = team_info
-            
-            # Fetch display names for both players
+        for team in teams:
+            team_name, player1_id, player2_id, elo_rating, match_count = team
             player1_name = await get_common_name_from_ranked_players(conn, player1_id)
             player2_name = await get_common_name_from_ranked_players(conn, player2_id)
             embed.add_field(
-                name=f"#{position} - Team: {team_name}",
-                value=f"Players: {player1_name} and {player2_name} - ELO: {elo_rating}",
+                name=f"{team_name} - {elo_rating}  (Matches Played: {match_count})",
+                value=f"Players: {player1_name} and {player2_name}",
                 inline=False
             )
 
@@ -1478,6 +1463,7 @@ async def duo_teams(interaction: discord.Interaction):
         await interaction.response.send_message("An error occurred while retrieving the duo teams.", ephemeral=True)
     finally:
         await conn.close()
+
 
 ##########END OF DUOS#############
 ##################################
@@ -2230,5 +2216,14 @@ async def setname(interaction: discord.Interaction, name: str):
         if conn:
             await conn.close()
 
+
+def setup():
+    bot.add_cog(AdminCommands(bot))
+    bot.add_cog(LTSCog(bot))
+    bot.add_cog(CoinCog(bot))
+    bot.add_cog(PrivateServers(bot))
+
+
+setup()
 # Run the Chivalry 2 discord ranked combat bot, maaan
 bot.run(TOKEN)
